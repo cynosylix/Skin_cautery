@@ -951,7 +951,7 @@ void debouncing(void) {
 		if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) //only eneter debounce limit is reached
 		{
 			pa7_pending = 0;         //clear interupt raised flag
-//			test++;
+
 			// Read stable pin state AFTER bounce settled
 			footswitch =
 					(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET);
