@@ -229,7 +229,7 @@ int main(void)
 	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Constant 50% PWM
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
 	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 312);
-
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 1500);
 //-----------------------------------------------------for  read eeprome value and transmit to display and store ram---------------------------------
 	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
 			1000);
@@ -339,7 +339,7 @@ int main(void)
 				HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_SET);
 				HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
 				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
-				pagechange[9] = 0x04;
+				pagechange[9] = 0x06;
 				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 				break;
 			case 0x4d:
@@ -349,7 +349,7 @@ int main(void)
 				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_SET);
 				HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
 				HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
-				pagechange[9] = 0x06;
+				pagechange[9] = 0x04;
 				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 				break;
 			}
@@ -365,7 +365,7 @@ if(ch_pg_flag)
 {
 	ch_pg_flag=false;
 
-			if((mode==0x4e)||(mode==0x4d))
+			if((mode==0x4f)||(mode==0x4d))
 					{
 				pagechange[9] = 0x01;
 				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
