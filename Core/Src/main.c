@@ -92,6 +92,7 @@ uint32_t last_adc_tick = 0;
 uint16_t adc_raw = 0;
 uint8_t pagechange[10] = { 0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00,
 		0x22 };
+uint8_t mapped_duty=0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,11 +100,11 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
-static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 uint16_t hex_scale_to_0_100(uint16_t dataa, uint16_t input_min_hex,
 		uint16_t input_span_hex);
@@ -214,11 +215,11 @@ int main(void)
   MX_GPIO_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
-  MX_TIM1_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_I2C1_Init();
   MX_USART3_UART_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 	HAL_Delay(3000);
 	pagechange[9] = 0x01;
@@ -226,10 +227,10 @@ int main(void)
 	HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
 	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Variable PWM
-	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Constant 50% PWM
+	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Connstant PWM
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
-	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 312);
-	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 1500);
+	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
+	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300);//70%
 //-----------------------------------------------------for  read eeprome value and transmit to display and store ram---------------------------------
 	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
 			1000);
@@ -320,7 +321,9 @@ int main(void)
 		if ((footswitch) || (active)) {
 			ch_pg_flag=true;
 			HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-			HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+			HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); //70%pwm
+			HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
+
 			HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
 			switch (mode) {
 			case 0x4f:
@@ -332,6 +335,7 @@ int main(void)
 				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
 				pagechange[9] = 0x05;
 				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
+
 				break;
 			case 0x4e:
 				duty = hex_scale_to_0_100(low, INPUT_MIN_LOW, INPUT_MAX_LOW); //map lower limit and higher limit into 0-100
@@ -357,6 +361,7 @@ int main(void)
 		} else {
 			HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
 			HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3);
+			HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1); //audio
 			HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_SET);
 			HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
 			HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
@@ -530,9 +535,9 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 71;
+  htim1.Init.Prescaler = 44;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 624;
+  htim1.Init.Period = 999;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -824,26 +829,42 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void TIM3_SetDutyPercent(uint8_t duty) {
-	if (duty > 100)
-		duty = 100;
+//void TIM3_SetDutyPercent(uint8_t duty) {
+//	if (duty > 100)
+//		duty = 100;
+//
+//	ccr = (duty * (TIM3_ARR + 1)) / 100;
+//	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccr);
+//}
+void TIM3_SetDutyPercent(uint8_t duty)
+{
+    if (duty < 16)
+        duty = 16;
+    else if (duty > 84)
+        duty = 84;
 
-	ccr = (duty * (TIM3_ARR + 1)) / 100;
-	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccr);
+    uint32_t ccr = (duty * (TIM3_ARR + 1)) / 100;
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccr);
 }
-uint16_t hex_scale_to_0_100(uint16_t dataa, uint16_t input_min_hex,
-		uint16_t input_span_hex) {
-	if (input_span_hex == 0)
-		return 0;   // avoid division by zero
 
-	if (dataa <= input_min_hex)
-		return 0;
 
-	if (dataa >= (input_min_hex + input_span_hex))
-		return 100;
+uint16_t hex_scale_to_0_100(uint16_t dataa,
+                             uint16_t input_min_hex,
+                             uint16_t input_span_hex)
+{
+    if (input_span_hex == 0)
+        return 16;
 
-	return (uint16_t) (((dataa - input_min_hex) * 100U) / input_span_hex);
+    if (dataa <= input_min_hex)
+        return 16;
+
+    if (dataa >= (input_min_hex + input_span_hex))
+        return 84;
+
+    // Linear mapping to 16–84
+    return 16 + ((dataa - input_min_hex) * 68U) / input_span_hex;
 }
+
 
 void save_reading(void) {
 	if (number_eeprome_flag) {

@@ -73,8 +73,6 @@ void Error_Handler(void);
 #define hv_pwm_GPIO_Port GPIOA
 #define hv_en_Pin GPIO_PIN_1
 #define hv_en_GPIO_Port GPIOB
-#define tone_Pin GPIO_PIN_8
-#define tone_GPIO_Port GPIOA
 #define gate_Pin GPIO_PIN_8
 #define gate_GPIO_Port GPIOB
 
