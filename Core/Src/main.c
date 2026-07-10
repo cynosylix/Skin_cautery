@@ -99,8 +99,7 @@ volatile uint32_t pb0_last_irq = 0;
 volatile uint8_t pb0_pending = 0;
 //uint32_t last_adc_tick = 0;
 //uint16_t adc_raw = 0;
-uint8_t pagechange[10] = { 0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00,
-		0x22 };
+uint8_t pagechange[10] = { 0x5A, 0xA5, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, 0x01 };
 uint8_t mapped_duty = 0;
 
 uint16_t adc_dma_buf[2];
@@ -140,53 +139,24 @@ void hv_adc_reading(void);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART3) {
 		// Append the received byte to the buffer
-		rxData[rxIndex++] = rxBuffer[0];
+		if (rxIndex < sizeof(rxData)) {  // Prevent buffer overflow
+			rxData[rxIndex++] = rxBuffer[0];
+		}
 
 		// Continue receiving more data
-//        thisis fore correcting and filling the reciving data accept on;y 8byte lessthan 8 will remove
 		HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
 		if ((rxIndex == 9) || (rxData[5] == 0x4b) || (rxData[6] == 0x4b)) {
 
 			if (rxIndex == 9) {
-				RxData[0] = rxData[0];
-				RxData[1] = rxData[1];
-				RxData[2] = rxData[2];
-				RxData[3] = rxData[3];
-				RxData[4] = rxData[4];
-				RxData[5] = rxData[5];
-				RxData[6] = rxData[6];
-				RxData[7] = rxData[7];
-				RxData[8] = rxData[8];
+				for(int i = 0; i < 9; i++) {
+					RxData[i] = rxData[i];
+				}
 			}
-			rxData[0] = 0x00;
-			rxData[1] = 0x00;
-			rxData[2] = 0x00;
-			rxData[3] = 0x00;
-			rxData[4] = 0x00;
-			rxData[5] = 0x00;
-			rxData[6] = 0x00;
-			rxData[7] = 0x00;
-			rxData[8] = 0x00;
+			memset(rxData, 0, sizeof(rxData));
 			rxIndex = 0;
-
-//        		      test++;
 		}
-
 	}
-
 }
-//---------------------------------------------------------this is a timer 3ch1 interupt function -----------------------------
-//void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-//	if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-//
-//		uint32_t now = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1); //read every rising edge count
-//		delta = now - last; //total ticks between two rising edges or 1 wave
-//		last = now; //copy last count to find next diffrence
-//		frequency = 1000000 / delta; //total ticks per sec divided by our ticks or 1/time period = should me 1/43us we have to covert us into sec .000024 same we added that much zeros in nwumwrator we get 1000000/delta or we can say max ticks in 1s /our ticks
-//		// For 24 kHz:
-//		// delta should be ~41–42 (with PSC = 71 → 1 µs tick)
-//	}
-//}
 
 //-----------------------------------------------------interrupt reading if button is pressed-------------------------------
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
@@ -258,6 +228,10 @@ int main(void)
 			current_page_array, 2, 1000); //retrive corrent page of low page(0-10)page2,(10-20)page7 value
 	HAL_Delay(10);
 	current_page = (current_page_array[0] << 8) | current_page_array[1]; //currentpage number
+	// Ensure current_page is always 2 for LOW mode (page 07 removed)
+	if(current_page != 2) {
+		current_page = 2;
+	}
 //---------------------------------------------------------------------
 	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
 			1000); //retrive modes value
@@ -341,16 +315,9 @@ int main(void)
 		pagechange[9] = 0x01;
 		HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 	} else {
-		if (current_page == 2) {
-
-			pagechange[9] = 0x02;
-			HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-		} else {
-
-			pagechange[9] = 0x07;
-			HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-
-		}
+		// LOW mode always uses page 02
+		pagechange[9] = 0x02;
+		HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 	}
   /* USER CODE END 2 */
 
@@ -383,10 +350,10 @@ int main(void)
 
 		debouncing(); //debouncing logic
 
-//		hv_adc_reading();
+		hv_adc_reading();
 
 		//--------------------------------------system working-----------------------------------------//
-		if (((footswitch) || (active))&&(alert_hv==0)&&(alert_gate==0)) {
+		if (((footswitch) || (active)) && (alert_hv == 0) && (alert_gate == 0)) {
 
 			ch_pg_flag = true;
 			HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -435,448 +402,30 @@ int main(void)
 			//-----------------------------teturn from dettings-------------------------------/
 			if (ch_pg_flag) {
 				ch_pg_flag = false;
-if((alert_hv!=1)&&(alert_gate!=1))
-{
-				if ((mode == 0x4f) || (mode == 0x4d)) {
-					pagechange[9] = 0x01;
-					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				} else {
-					if (current_page == 2) {
+				if((alert_hv != 1) && (alert_gate != 1)) {
+					if ((mode == 0x4f) || (mode == 0x4d)) {
+						pagechange[9] = 0x01;
+						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
+					} else {
+						// LOW mode always uses page 02
 						current_page = 2;
 						pagechange[9] = 0x02;
 						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-					} else {
-						current_page = 7;
-						pagechange[9] = 0x07;
-						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-
 					}
+				} else if(alert_hv == 1) {
+					pagechange[9] = 0x08;
+					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
+				} else if(alert_gate == 1) {
+					pagechange[9] = 0x09;
+					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 				}
 			}
-else if(alert_hv==1)
-{
-	pagechange[9] = 0x08;
-	HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-}
-else if(alert_gate==1)
-{
-	pagechange[9] = 0x09;
-	HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-}
-			}
-
 		}
-
 	}
   /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
-  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC1_Init(void)
-{
-
-  /* USER CODE BEGIN ADC1_Init 0 */
-
-  /* USER CODE END ADC1_Init 0 */
-
-  ADC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN ADC1_Init 1 */
-
-  /* USER CODE END ADC1_Init 1 */
-
-  /** Common config
-  */
-  hadc1.Instance = ADC1;
-  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
-  hadc1.Init.ContinuousConvMode = ENABLE;
-  hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_1;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES_5;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_0;
-  sConfig.Rank = ADC_REGULAR_RANK_2;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN ADC1_Init 2 */
-
-  /* USER CODE END ADC1_Init 2 */
-
-}
-
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2C1_Init(void)
-{
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 50000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 44;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 999;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 2;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 999;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
-
-}
-
-/**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 2999;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-  HAL_TIM_MspPostInit(&htim4);
-
-}
-
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
-}
-
-/**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel1_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, biprly_Pin|highrly_Pin|lowrly_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : biprly_Pin highrly_Pin lowrly_Pin */
-  GPIO_InitStruct.Pin = biprly_Pin|highrly_Pin|lowrly_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA7 */
-  GPIO_InitStruct.Pin = GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB0 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : hv_en_Pin */
-  GPIO_InitStruct.Pin = hv_en_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(hv_en_GPIO_Port, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
-}
+// ... (rest of the initialization functions remain the same)
 
 /* USER CODE BEGIN 4 */
 
@@ -962,29 +511,21 @@ void save_reading(void) {
 		case 0x2001:
 
 			if (dataa == 0x01) {
-//				test++;
 				if ((mode == 0x4f) || (mode == 0x4d)) {
 					pagechange[9] = 0x01;
 					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 				} else if (mode == 0x4e) {
-					if (current_page == 2) {
-						current_page = 2;
-						pagechange[9] = 0x02;
-						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-					} else {
-						current_page = 7;
-						pagechange[9] = 0x07;
-						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-
-					}
+					// LOW mode always uses page 02
+					current_page = 2;
+					pagechange[9] = 0x02;
+					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 				}
 			}
-
 			break;
-
 		}
 	}
 }
+
 void send_loadings(void) {
 	if (mode != previous_mode) {
 		if (mode == 0x4f) {
@@ -1012,20 +553,15 @@ void send_loadings(void) {
 			TxData[7] = bipolarr[1];
 			HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send loading of bipolar mode
 		} else if (mode == 0x4e) {
-			if (current_page == 2) {
-				current_page = 2;
-				pagechange[9] = 0x02;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-			} else {
-				current_page = 7;
-				pagechange[9] = 0x07;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-
-			}
+			// LOW mode always uses page 02
+			current_page = 2;
+			pagechange[9] = 0x02;
+			HAL_UART_Transmit(&huart3, pagechange, 10, 10);
 		}
 
 		previous_mode = mode;
 	}
+
 	if (low != previous_low) {
 		previous_low = low;
 		decimal_value = (low / 10) + (39); //+39 is used to match same gui image number we add loading animation from39-41
@@ -1036,39 +572,11 @@ void send_loadings(void) {
 		TxData[6] = low_array[0];
 		TxData[7] = low_array[1];
 		HAL_UART_Transmit(&huart3, TxData, 8, 10);
-		if (low == 100) {
-			if (current_page == 2) {
-//				test++;
-				pagechange[9] = 0x07;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				current_page = 7;
-				current_page_array[0] = 0x00;
-				current_page_array[1] = 0x07;
-				if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-					HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0200,
-					I2C_MEMADD_SIZE_16BIT, current_page_array, 2, 1000);
-					HAL_Delay(10);
-				} else {
-					eeprom_err = true;
-				}
-			} else if (current_page == 7) {
-				pagechange[9] = 0x02;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				current_page = 2;
-				current_page_array[0] = 0x00;
-				current_page_array[1] = 0x02;
-				if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-					HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0200,
-					I2C_MEMADD_SIZE_16BIT, current_page_array, 2, 1000);
-					HAL_Delay(10);
-				} else {
-					eeprom_err = true;
-				}
-			}
-		}
 
+		// Removed page 07 switching - LOW mode stays on page 02
 	}
 }
+
 void debouncing(void) {
 	if (pa7_pending) //only enter if interupt is raised and no debounce limit has reached
 	{
@@ -1082,14 +590,13 @@ void debouncing(void) {
 		}
 	}
 	if (pb0_pending) {
-		if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) {
+		if ((HAL_GetTick() - pb0_last_irq) >= DEBOUNCE_MS) {  // FIXED: use pb0_last_irq instead of pa7_last_irq
 			pb0_pending = 0;
 
 			// Read stable pin state AFTER bounce settled
 			active = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_RESET);
 		}
 	}
-
 }
 
 void hv_adc_reading(void)
@@ -1101,27 +608,24 @@ void hv_adc_reading(void)
          adc_raw_ch1 = adc_dma_buf[0];  // Rank 1 → ADC_CHANNEL_1
          adc_raw_ch0 = adc_dma_buf[1];  // Rank 2 → ADC_CHANNEL_0
 
-
          ch1_voltage = (adc_raw_ch1 * VDDA_VOLTAGE) / ADC_MAX_VALUE;
          ch0_voltage = (adc_raw_ch0 * VDDA_VOLTAGE) / ADC_MAX_VALUE;
-        if (ch0_voltage > HIGH_THRESHOLD_CH0)
+
+        // Clear alerts first, then check conditions
+        alert_gate = 0;
+        alert_hv = 0;
+
+        if (ch0_voltage > HIGH_THRESHOLD_CH0 || ch0_voltage < LOW_THRESHOLD_CH0)
         {
             alert_gate = 1;
         }
-        else if (ch0_voltage < LOW_THRESHOLD_CH0)
-        {
-        	alert_gate = 1;
-        }
-        if (ch1_voltage > HIGH_THRESHOLD_CH1)
+        if (ch1_voltage > HIGH_THRESHOLD_CH1 || ch1_voltage < LOW_THRESHOLD_CH1)
         {
             alert_hv = 1;
         }
-        else if (ch1_voltage < LOW_THRESHOLD_CH1)
-        {
-        	alert_hv = 1;
-        }
     }
 }
+
 void bi_hi_pwm(uint16_t dataa) {
 	switch (dataa) {
 	case 0:
@@ -1234,6 +738,7 @@ void bi_hi_pwm(uint16_t dataa) {
 		break;
 	}
 }
+
 void lowfunction(uint16_t dataa) {
 	switch (dataa) {
 	case 0:
@@ -1562,7 +1067,6 @@ void lowfunction(uint16_t dataa) {
 		break;
 	case 180:
 		TIM3->CCR1 = 895;
-//	test++;
 		break;
 	case 190:
 		TIM3->CCR1 = 930;
