@@ -1,6 +1,6 @@
 ################################################################################
 # Automatically-generated file. Do not edit!
-# Toolchain: GNU Tools for STM32 (12.3.rel1)
+# Toolchain: GNU Tools for STM32 (14.3.rel1)
 ################################################################################
 
 -include ../makefile.init
@@ -60,8 +60,8 @@ all: main-build
 main-build: skinquatery.elf secondary-outputs
 
 # Tool invocations
-skinquatery.elf skinquatery.map: $(OBJS) $(USER_OBJS) D:\everything\my_works\stm32\skinquatery\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "skinquatery.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"D:\everything\my_works\stm32\skinquatery\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="skinquatery.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+skinquatery.elf skinquatery.map: $(OBJS) $(USER_OBJS) C:\Users\SANDHRA\ SHIJO\Cardlac\stm32_code\skinquatery\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "skinquatery.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\SANDHRA SHIJO\Cardlac\stm32_code\skinquatery\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="skinquatery.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
