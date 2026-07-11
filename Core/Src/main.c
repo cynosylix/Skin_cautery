@@ -47,6 +47,8 @@
 #define ADC_MAX_VALUE   4095.0f
 #define VDDA_VOLTAGE    3.3f    // change ONLY if VDDA is different
 #define VP_LOW_VALUE    0x1000  // DWIN variable address for low value
+#define VP_VAR_ICON     0x2000  // DWIN variable address for variable icon
+#define MIN_VAR_ICON_VALUE 76   // Minimum value for variable icon
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,7 +75,8 @@ int test;
 uint8_t RxData[9];
 uint8_t rxBuffer[9];
 uint8_t rxData[9];
-uint16_t rxIndex = 0;
+volatile uint16_t rxIndex = 0;
+static uint8_t uart_rx_started = 0;
 uint16_t address, dataa, mode, high, bipolar, low, icon_id, brightnes,
 		current_page, previous_mode;
 uint8_t duty;
@@ -113,6 +116,10 @@ uint8_t alert_gate = 0;
 float ch1_voltage;
 float ch0_voltage=1.6f;
 //uint16_t addr = 0x0100;   // not 0100
+
+// Variable icon storage (VP 0x2000)
+uint16_t var_icon_value = 76;  // Default minimum value
+uint8_t var_icon_data[2] = {0x00, 0x4C};  // 76 in hex (0x004C)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -134,6 +141,11 @@ void send_loadings(void);
 void debouncing(void);
 void hv_adc_reading(void);
 void send_low_to_display(void);
+void send_page_change(uint8_t page_num);
+void dwin_boot_to_page(uint8_t page_num);
+void dwin_uart_rx_start(void);
+void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low);
+void send_var_icon_to_display(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -147,15 +159,30 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
 		// Continue receiving more data
 		HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
-		if ((rxIndex == 9) || (rxData[5] == 0x4b) || (rxData[6] == 0x4b)) {
 
-			if (rxIndex == 9) {
-				for(int i = 0; i < 9; i++) {
-					RxData[i] = rxData[i];
+		// Check if we have a complete packet (minimum 5 bytes for DWIN)
+		if (rxIndex >= 5) {
+			// Check for DWIN frame header 0x5A 0xA5
+			if (rxData[0] == 0x5A && rxData[1] == 0xA5) {
+				uint8_t data_len = rxData[2];  // Data length
+				uint8_t total_len = data_len + 3;  // Total frame length (header + data + CRC)
+
+				// Check if we have received the complete frame
+				if (rxIndex >= total_len) {
+					// Copy the complete frame to RxData
+					for(int i = 0; i < total_len && i < 9; i++) {
+						RxData[i] = rxData[i];
+					}
+
+					// Clear buffer and reset index
+					memset(rxData, 0, sizeof(rxData));
+					rxIndex = 0;
 				}
+			} else {
+				// Invalid frame, reset buffer
+				memset(rxData, 0, sizeof(rxData));
+				rxIndex = 0;
 			}
-			memset(rxData, 0, sizeof(rxData));
-			rxIndex = 0;
 		}
 	}
 }
@@ -173,6 +200,59 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	}
 }
 
+// Start UART receive once (callback chain keeps it running)
+void dwin_uart_rx_start(void) {
+    if (!uart_rx_started) {
+        rxIndex = 0;
+        memset(rxData, 0, sizeof(rxData));
+        HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
+        uart_rx_started = 1;
+    }
+}
+
+static void dwin_uart_send(const uint8_t *data, uint16_t len) {
+    __HAL_UART_CLEAR_OREFLAG(&huart3);
+    if (HAL_UART_Transmit(&huart3, (uint8_t *)data, len, 1000) != HAL_OK) {
+        HAL_Delay(10);
+        HAL_UART_Transmit(&huart3, (uint8_t *)data, len, 1000);
+    }
+}
+
+void send_page_change(uint8_t page_num) {
+    uint8_t cmd[10] = {
+        0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84,
+        0x5A, 0x01, 0x00, page_num
+    };
+    dwin_uart_send(cmd, 10);
+    HAL_Delay(30);
+}
+
+// Show 00.bmp, then retry page change until DWIN UART is ready
+void dwin_boot_to_page(uint8_t page_num) {
+    HAL_Delay(3000);
+    for (uint8_t i = 0; i < 15; i++) {
+        send_page_change(page_num);
+        HAL_Delay(400);
+    }
+}
+
+void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low) {
+    uint8_t cmd[8] = {
+        0x5A, 0xA5, 0x05, 0x82,
+        addr_high, addr_low, data_high, data_low
+    };
+    dwin_uart_send(cmd, 8);
+    HAL_Delay(20);
+}
+
+void send_var_icon_to_display(void) {
+    uint8_t cmd[8] = {
+        0x5A, 0xA5, 0x05, 0x82, 0x20, 0x00,
+        var_icon_data[0], var_icon_data[1]
+    };
+    dwin_uart_send(cmd, 8);
+    HAL_Delay(20);
+}
 /* USER CODE END 0 */
 
 /**
@@ -211,226 +291,205 @@ int main(void)
   MX_I2C1_Init();
   MX_USART3_UART_Init();
   MX_TIM1_Init();
+
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc1); // MUST be before DMA start
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma_buf, 2);
 
-	HAL_Delay(3000);
-	pagechange[9] = 0x01;
-	HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-	HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
-//	HAL_TIM_IC_Start_IT(&htim2, TIM_CHANNEL_1);
-	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Variable PWM
-	HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Connstant PWM
-	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
-	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
-	__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300); //70%
-//-----------------------------------------------------for  read eeprome value and transmit to display and store ram---------------------------------
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0200, I2C_MEMADD_SIZE_16BIT,
-			current_page_array, 2, 1000); //retrive corrent page of low page(0-10)page2,(10-20)page7 value
-	HAL_Delay(10);
-	current_page = (current_page_array[0] << 8) | current_page_array[1]; //currentpage number
-	// Ensure current_page is always 2 for LOW mode (page 07 removed)
-	if(current_page != 2) {
-		current_page = 2;
-	}
+  HAL_Delay(200);
+  dwin_boot_to_page(0x02);
+  dwin_uart_rx_start();
+
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Variable PWM
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Constant PWM
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300); //70%
+
+//-----------------------------------------------------for read eeprom value and transmit to display and store ram---------------------------------
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0200, I2C_MEMADD_SIZE_16BIT,
+          current_page_array, 2, 1000); //retrive current page of low page(0-10)page2,(10-20)page7 value
+  HAL_Delay(10);
+  current_page = (current_page_array[0] << 8) | current_page_array[1]; //currentpage number
+  // Ensure current_page is always 2 for LOW mode (page 07 removed)
+  if(current_page != 2) {
+      current_page = 2;
+  }
+
 //---------------------------------------------------------------------
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
-			1000); //retrive modes value
-	HAL_Delay(10);
-	mode = (modee[0] << 8) | modee[1];
-	TxData[4] = 0x20;
-	TxData[5] = 0x00;
-	TxData[6] = modee[0];
-	TxData[7] = modee[1];
-	HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send corrent mode
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
+          1000); //retrive modes value
+  HAL_Delay(10);
+  mode = (modee[0] << 8) | modee[1];
+
+  // Send mode to display
+  send_variable_data(0x20, 0x00, modee[0], modee[1]);
+
 //-----------------------------------------------------------------------------
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0014, I2C_MEMADD_SIZE_16BIT, highh, 2,
-			1000); //retrive high value
-	HAL_Delay(10);
-	high = (highh[0] << 8) | highh[1];
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0014, I2C_MEMADD_SIZE_16BIT, highh, 2,
+          1000); //retrive high value
+  HAL_Delay(10);
+  high = (highh[0] << 8) | highh[1];
+
 //-------------------------------------------------------------------------------
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0018, I2C_MEMADD_SIZE_16BIT, bipolarr,
-			2, 1000); //retrive bipolar value
-	HAL_Delay(10);
-	bipolar = (bipolarr[0] << 8) | bipolarr[1];
-//----------------------------------------------perform correspondng data uploadings depending on modes .both modes share same variable location---------------------------------
-	if (mode == 0x4f) {
-		TxData[4] = 0x30;
-		TxData[5] = 0x03;
-		TxData[6] = highh[0];
-		TxData[7] = highh[1];
-		HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send high mode's variable data
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0018, I2C_MEMADD_SIZE_16BIT, bipolarr,
+          2, 1000); //retrive bipolar value
+  HAL_Delay(10);
+  bipolar = (bipolarr[0] << 8) | bipolarr[1];
 
-		TxData[4] = 0x20;
-		TxData[5] = 0x01;
-		TxData[6] = highh[0];
-		TxData[7] = highh[1];
-		HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send loading of high mode
-	} else if (mode == 0x4d) {
-		TxData[4] = 0x30;
-		TxData[5] = 0x03;
-		TxData[6] = bipolarr[0];
-		TxData[7] = bipolarr[1];
-		HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send bipolar mode's variable data
+//----------------------------------------------perform corresponding data uploads depending on modes---------------------------------
+  if (mode == 0x4f) {
+      send_variable_data(0x30, 0x03, highh[0], highh[1]); //send high mode's variable data
+      send_variable_data(0x20, 0x01, highh[0], highh[1]); //send loading of high mode
+  } else if (mode == 0x4d) {
+      send_variable_data(0x30, 0x03, bipolarr[0], bipolarr[1]); //send bipolar mode's variable data
+      send_variable_data(0x20, 0x01, bipolarr[0], bipolarr[1]); //send loading of bipolar mode
+  }
 
-		TxData[4] = 0x20;
-		TxData[5] = 0x01;
-		TxData[6] = bipolarr[0];
-		TxData[7] = bipolarr[1];
-		HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send loading of bipolar mode
-	}
 //--------------------------------------------------------------------------------------
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x002A, I2C_MEMADD_SIZE_16BIT, loww, 2,
-			1000);
-	HAL_Delay(10);
-	low = (loww[0] << 8) | loww[1];
-	TxData[4] = 0x30;
-	TxData[5] = 0x02;
-	TxData[6] = loww[0];
-	TxData[7] = loww[1];
-	HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send low mode's variable data
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x002A, I2C_MEMADD_SIZE_16BIT, loww, 2,
+          1000);
+  HAL_Delay(10);
+  low = (loww[0] << 8) | loww[1];
 
-	// NEW ICON MAPPING: Map 0-200 to icon 0-100
-	icon_id = low / 2;  // 0-200 maps to 0-100
+  // Send low value to display
+  send_variable_data(0x30, 0x02, loww[0], loww[1]);
 
-	icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
-	icon_array[1] = icon_id & 0xFF;         // low byte
-	TxData[4] = 0x20;
-	TxData[5] = 0x02;
-	TxData[6] = icon_array[0];
-	TxData[7] = icon_array[1];
-	HAL_UART_Transmit(&huart3, TxData, 8, 10);         //to send loadings of low
+  // NEW ICON MAPPING: Map 0-200 to icon 0-100
+  icon_id = low / 2;  // 0-200 maps to 0-100
 
-	// Send current low value to display variable icon at 0x1000
-	send_low_to_display();
+  icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
+  icon_array[1] = icon_id & 0xFF;         // low byte
+  send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
 
-	HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0100, I2C_MEMADD_SIZE_16BIT,
-			brightness, 2, 1000);
-	brightnes = (brightness[0] << 8) | brightness[1];
-	TxData[4] = 0x00;
-	TxData[5] = 0x82;
-	TxData[6] = brightness[0];
-	TxData[7] = brightness[1];
+  // Send current low value to display variable icon at 0x1000
+  send_low_to_display();
 
-	HAL_UART_Transmit(&huart3, TxData, 8, 10);
+  // Read variable icon value from EEPROM (VP 0x2000)
+  // If value < 76, set it to 76 and save back
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
+          var_icon_data, 2, 1000);
+  HAL_Delay(10);
+  var_icon_value = (var_icon_data[0] << 8) | var_icon_data[1];
+
+  // Enforce minimum value of 76
+  if (var_icon_value < MIN_VAR_ICON_VALUE) {
+      var_icon_value = MIN_VAR_ICON_VALUE;
+      var_icon_data[0] = (var_icon_value >> 8) & 0xFF;
+      var_icon_data[1] = var_icon_value & 0xFF;
+      // Save corrected value back to EEPROM
+      HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
+                        var_icon_data, 2, 1000);
+      HAL_Delay(10);
+  }
+
+  // Send variable icon value to display at VP 0x2000
+  send_var_icon_to_display();
+
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0100, I2C_MEMADD_SIZE_16BIT,
+          brightness, 2, 1000);
+  brightnes = (brightness[0] << 8) | brightness[1];
+  send_variable_data(0x00, 0x82, brightness[0], brightness[1]);
+
 //---------------------------------------------------------------------------------------------------------------------------------------------------
 
-	//to send last saved page
-	if ((mode == 0x4f) || (mode == 0x4d)) {
-		pagechange[9] = 0x01;
-		HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-	} else {
-		// LOW mode always uses page 02
-		pagechange[9] = 0x02;
-		HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-	}
+  // Upload display variables (page already set to 02.bmp during boot)
+  current_page = 2;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-	while (1) {
+  while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		HAL_UART_Receive_IT(&huart3, rxBuffer, 1); //to read uart display interupt continuously
-		// Combine RxData[4] and RxData[5] into a 16-bit address
-		address = (RxData[4] << 8) | RxData[5]; //copy adress from recived display data
-
-		// Combine RxData[8] and RxData[9] into a 16-bit data
-		dataa = (RxData[7] << 8) | RxData[8]; //copy data from recived display data
+    HAL_Delay(1);
 
 
+    // Combine RxData[4] and RxData[5] into a 16-bit address
+    address = (RxData[4] << 8) | RxData[5]; //copy address from received display data
 
-		if ((address != prev_address) || (dataa != prev_dataa)) //to detect data or adress is changed by touching humans?
-				{
-			number_eeprome_flag = true; //just raise a flag if touch happens othervise continue
-//we cant able to add this in interrupt function of display so we need to taje this from loop
-			prev_address = address; //to detect change remember past value
-			prev_dataa = dataa; //to detect change remember past value
-		}
+    // Combine RxData[6] and RxData[7] into a 16-bit data
+    dataa = (RxData[6] << 8) | RxData[7]; //copy data from received display data
 
-//		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, dataa);
+    if ((address != prev_address) || (dataa != prev_dataa)) //to detect data or address is changed
+    {
+        number_eeprome_flag = true; //raise a flag if touch happens
+        prev_address = address; //remember past value
+        prev_dataa = dataa; //remember past value
+    }
 
-		count++; //counter to understand is this device is in running?
+    count++; //counter to verify device is running
 
-		save_reading(); //to save recived datas to corresponding spaces
-		send_loadings(); //if any data is changed we have to update gui a loading icon
+    save_reading(); //to save received data to corresponding spaces
+    send_loadings(); //if any data is changed we have to update GUI loading icon
 
-		debouncing(); //debouncing logic
+    debouncing(); //debouncing logic
 
-		hv_adc_reading();
+    hv_adc_reading();
 
-		//--------------------------------------system working-----------------------------------------//
-		if (((footswitch) || (active)) && (alert_hv == 0) && (alert_gate == 0)) {
+    //--------------------------------------system working-----------------------------------------//
+    if (((footswitch) || (active)) && (alert_hv == 0) && (alert_gate == 0)) {
 
-			ch_pg_flag = true;
-			HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-			HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); //70%pwm
-			HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
+        ch_pg_flag = true;
+        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); //70%pwm
+        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
 
-			HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
-			switch (mode) {
-			case 0x4f:
-				bi_hi_pwm(high);
-				HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_SET);
-				HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
-				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
-				pagechange[9] = 0x05;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
+        HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
+        switch (mode) {
+        case 0x4f:
+            bi_hi_pwm(high);
+            HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
+            send_page_change(0x05);
+            break;
+        case 0x4e:
+            lowfunction(low);
+            HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_SET);
+            send_page_change(0x06);
+            break;
+        case 0x4d:
+            bi_hi_pwm(bipolar);
+            HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_SET);
+            send_page_change(0x04);
+            break;
+        }
+        hv_adc_reading();
 
-				break;
-			case 0x4e:
-				lowfunction(low);
-				HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
-				HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
-				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_SET);
-				pagechange[9] = 0x06;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				break;
-			case 0x4d:
-				bi_hi_pwm(bipolar);
-				HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
-				HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
-				HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_SET);
-				pagechange[9] = 0x04;
-				HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				break;
-			}
-			hv_adc_reading();
+    } else {
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+        HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3);
+        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1); //audio
+        HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
 
-		} else {
-			HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
-			HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3);
-			HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1); //audio
-			HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_SET);
-			HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
-			HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
-			HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
-
-			//-----------------------------teturn from dettings-------------------------------/
-			if (ch_pg_flag) {
-				ch_pg_flag = false;
-				if((alert_hv != 1) && (alert_gate != 1)) {
-					if ((mode == 0x4f) || (mode == 0x4d)) {
-						pagechange[9] = 0x01;
-						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-					} else {
-						// LOW mode always uses page 02
-						current_page = 2;
-						pagechange[9] = 0x02;
-						HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-					}
-				} else if(alert_hv == 1) {
-					pagechange[9] = 0x08;
-					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				} else if(alert_gate == 1) {
-					pagechange[9] = 0x09;
-					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				}
-			}
-		}
-	}
+        //-----------------------------return from settings-------------------------------/
+        if (ch_pg_flag) {
+            ch_pg_flag = false;
+            if((alert_hv != 1) && (alert_gate != 1)) {
+                if ((mode == 0x4f) || (mode == 0x4d)) {
+                    send_page_change(0x01);
+                } else {
+                    // LOW mode always uses page 02
+                    current_page = 2;
+                    send_page_change(0x02);
+                }
+            } else if(alert_hv == 1) {
+                send_page_change(0x08);
+            } else if(alert_gate == 1) {
+                send_page_change(0x09);
+            }
+        }
+    }
+  }
   /* USER CODE END 3 */
 }
 
@@ -456,7 +515,17 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
-    Error_Handler();
+    /* HSE crystal missing/bad: fall back to internal HSI clock */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSEState = RCC_HSE_OFF;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+    RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
@@ -844,227 +913,229 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void send_low_to_display(void) {
-    // Send current low value to DWIN variable icon at address 0x1000
-    uint8_t data[6] = {0x5A, 0xA5, 0x05, 0x82, 0x10, 0x00};
-    uint16_t display_value = low;  // Value 0-200
-
-    data[4] = (display_value >> 8) & 0xFF;  // High byte
-    data[5] = display_value & 0xFF;         // Low byte
-
-    HAL_UART_Transmit(&huart3, data, 6, 10);
+    uint8_t cmd[8] = {
+        0x5A, 0xA5, 0x05, 0x82, 0x10, 0x00,
+        (uint8_t)((low >> 8) & 0xFF), (uint8_t)(low & 0xFF)
+    };
+    dwin_uart_send(cmd, 8);
+    HAL_Delay(20);
 }
 
 void save_reading(void) {
-	if (number_eeprome_flag) {
-		number_eeprome_flag = false;
+    if (number_eeprome_flag) {
+        number_eeprome_flag = false;
 
-		// Handle DWIN variable icon at 0x1000 (Low value control)
-		if (address == VP_LOW_VALUE) {
-			uint16_t new_low = dataa;
-			// Limit the value to 0-200 range
-			if (new_low > 200) new_low = 200;
+        // Handle variable icon at VP 0x2000
+        if (address == VP_VAR_ICON) {
+            uint16_t new_value = dataa;
 
-			if (new_low != low) {
-				low = new_low;
-				loww[0] = (low >> 8) & 0xFF;
-				loww[1] = low & 0xFF;
+            // Enforce minimum value of 76
+            if (new_value < MIN_VAR_ICON_VALUE) {
+                new_value = MIN_VAR_ICON_VALUE;
+                // Send corrected value back to display
+                var_icon_data[0] = (new_value >> 8) & 0xFF;
+                var_icon_data[1] = new_value & 0xFF;
+                send_var_icon_to_display();
+            } else {
+                var_icon_data[0] = RxData[6];
+                var_icon_data[1] = RxData[7];
+            }
 
-				// Save to EEPROM
-				if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-					HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
-					I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
-					HAL_Delay(10);
+            var_icon_value = new_value;
 
-					// Update PWM immediately if LOW mode is active
-					if (mode == 0x4e && ((footswitch) || (active))) {
-						lowfunction(low);
-					}
+            // Save to EEPROM
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300,
+                I2C_MEMADD_SIZE_16BIT, var_icon_data, 2, 1000);
+                HAL_Delay(10);
+            } else {
+                eeprom_err = true;
+            }
+            return; // Exit after handling variable icon
+        }
 
-					// NEW: Update display loading icon using new mapping (0-200 -> 0-100)
-					icon_id = low / 2;  // Map 0-200 to 0-100
-					icon_array[0] = (icon_id >> 8) & 0xFF;
-					icon_array[1] = icon_id & 0xFF;
-					TxData[4] = 0x20;
-					TxData[5] = 0x02;
-					TxData[6] = icon_array[0];
-					TxData[7] = icon_array[1];
-					HAL_UART_Transmit(&huart3, TxData, 8, 10);
+        // Handle DWIN variable icon at 0x1000 (Low value control)
+        if (address == VP_LOW_VALUE) {
+            uint16_t new_low = dataa;
+            // Limit the value to 0-200 range
+            if (new_low > 200) new_low = 200;
 
-					// Update display variable icon
-					send_low_to_display();
-				} else {
-					eeprom_err = true;
-				}
-			}
-		}
+            if (new_low != low) {
+                low = new_low;
+                loww[0] = (low >> 8) & 0xFF;
+                loww[1] = low & 0xFF;
 
-		switch (address) {
-		case 0x2000:  //engineers screen password location
+                // Save to EEPROM
+                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
+                    I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
+                    HAL_Delay(10);
 
-			mode = dataa;
-			modee[0] = RxData[7];
-			modee[1] = RxData[8];
-			if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-				HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x000A,
-				I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
-				HAL_Delay(10);
-			} else {
-				eeprom_err = true;
-			}
+                    // Update PWM immediately if LOW mode is active
+                    if (mode == 0x4e && ((footswitch) || (active))) {
+                        lowfunction(low);
+                    }
 
-			break;
-		case 0x3003:  //engineers screen password location
-			if (mode == 0x4f)  //same 3003 variable data guided to high variable
-					{
-				high = dataa;
-				highh[0] = RxData[7];
-				highh[1] = RxData[8];
-				if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-					HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0014,
-					I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
-					HAL_Delay(10);
-				} else {
-					eeprom_err = true;
-				}
-			}
-			if (mode == 0x4d) //same 3003 variable data guided to bipolar variable
-					{
-				bipolar = dataa;
-				bipolarr[0] = RxData[7];
-				bipolarr[1] = RxData[8];
-				if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-					HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0018,
-					I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
-					HAL_Delay(10);
-				} else {
-					eeprom_err = true;
-				}
-			}
-			break;
-		case 0x3002:
+                    // NEW: Update display loading icon using new mapping (0-200 -> 0-100)
+                    icon_id = low / 2;  // Map 0-200 to 0-100
+                    icon_array[0] = (icon_id >> 8) & 0xFF;
+                    icon_array[1] = icon_id & 0xFF;
+                    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
 
-			low = dataa;
-			loww[0] = RxData[7];
-			loww[1] = RxData[8];
+                    // Update display variable icon
+                    send_low_to_display();
+                } else {
+                    eeprom_err = true;
+                }
+            }
+            return; // Exit after handling low value
+        }
 
-			if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-				HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
-				I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
-				HAL_Delay(10);
-			} else {
-				eeprom_err = true;
-			}
+        switch (address) {
+        case 0x2000:  //engineers screen password location - Note: 0x2000 now used for var icon
+            // This case may need to be removed or changed since we're using 0x2000 for var icon
+            // Keeping for backward compatibility but with different handling
+            mode = dataa;
+            modee[0] = RxData[6];
+            modee[1] = RxData[7];
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x000A,
+                I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
+                HAL_Delay(10);
+            } else {
+                eeprom_err = true;
+            }
+            break;
 
-			break;
-		case 0x82:
+        case 0x3003:  //engineers screen password location
+            if (mode == 0x4f)  //same 3003 variable data guided to high variable
+            {
+                high = dataa;
+                highh[0] = RxData[6];
+                highh[1] = RxData[7];
+                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0014,
+                    I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
+                    HAL_Delay(10);
+                } else {
+                    eeprom_err = true;
+                }
+            }
+            if (mode == 0x4d) //same 3003 variable data guided to bipolar variable
+            {
+                bipolar = dataa;
+                bipolarr[0] = RxData[6];
+                bipolarr[1] = RxData[7];
+                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0018,
+                    I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
+                    HAL_Delay(10);
+                } else {
+                    eeprom_err = true;
+                }
+            }
+            break;
 
-			test++;
+        case 0x3002:
+            low = dataa;
+            loww[0] = RxData[6];
+            loww[1] = RxData[7];
 
-			brightnes = dataa;
-			brightness[0] = RxData[7];
-			brightness[1] = RxData[8];
-			if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-				HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0100,
-				I2C_MEMADD_SIZE_16BIT, brightness, 2, 1000);
-				HAL_Delay(10);
-			} else {
-				eeprom_err = true;
-			}
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
+                I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
+                HAL_Delay(10);
 
-			break;
+                // Update icon
+                icon_id = low / 2;
+                icon_array[0] = (icon_id >> 8) & 0xFF;
+                icon_array[1] = icon_id & 0xFF;
+                send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+                send_low_to_display();
+            } else {
+                eeprom_err = true;
+            }
+            break;
 
-		case 0x2001:
+        case 0x82:
+            test++;
+            brightnes = dataa;
+            brightness[0] = RxData[6];
+            brightness[1] = RxData[7];
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0100,
+                I2C_MEMADD_SIZE_16BIT, brightness, 2, 1000);
+                HAL_Delay(10);
+            } else {
+                eeprom_err = true;
+            }
+            break;
 
-			if (dataa == 0x01) {
-				if ((mode == 0x4f) || (mode == 0x4d)) {
-					pagechange[9] = 0x01;
-					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				} else if (mode == 0x4e) {
-					// LOW mode always uses page 02
-					current_page = 2;
-					pagechange[9] = 0x02;
-					HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-				}
-			}
-			break;
-		}
-	}
+        case 0x2001:
+            if (dataa == 0x01) {
+                if ((mode == 0x4f) || (mode == 0x4d)) {
+                    send_page_change(0x01);
+                } else if (mode == 0x4e) {
+                    // LOW mode always uses page 02
+                    current_page = 2;
+                    send_page_change(0x02);
+                }
+            }
+            break;
+        }
+    }
 }
 
 void send_loadings(void) {
-	if (mode != previous_mode) {
-		if (mode == 0x4f) {
-			TxData[4] = 0x30;
-			TxData[5] = 0x03;
-			TxData[6] = highh[0];
-			TxData[7] = highh[1];
-			HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send high mode's variable data
+    if (mode != previous_mode) {
+        if (mode == 0x4f) {
+            send_variable_data(0x30, 0x03, highh[0], highh[1]);
+            send_variable_data(0x20, 0x01, highh[0], highh[1]);
+        } else if (mode == 0x4d) {
+            send_variable_data(0x30, 0x03, bipolarr[0], bipolarr[1]);
+            send_variable_data(0x20, 0x01, bipolarr[0], bipolarr[1]);
+        } else if (mode == 0x4e) {
+            // LOW mode always uses page 02
+            current_page = 2;
+            send_page_change(0x02);
+            send_low_to_display();
+        }
+        previous_mode = mode;
+    }
 
-			TxData[4] = 0x20;
-			TxData[5] = 0x01;
-			TxData[6] = highh[0];
-			TxData[7] = highh[1];
-			HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send loading of high mode
-		} else if (mode == 0x4d) {
-			TxData[4] = 0x30;
-			TxData[5] = 0x03;
-			TxData[6] = bipolarr[0];
-			TxData[7] = bipolarr[1];
-			HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send bipolar mode's variable data
+    if (low != previous_low) {
+        previous_low = low;
+        // NEW: Map 0-200 to icon 0-100
+        icon_id = low / 2;
+        icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
+        icon_array[1] = icon_id & 0xFF;         // low byte
+        send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
 
-			TxData[4] = 0x20;
-			TxData[5] = 0x01;
-			TxData[6] = bipolarr[0];
-			TxData[7] = bipolarr[1];
-			HAL_UART_Transmit(&huart3, TxData, 8, 10); //to send loading of bipolar mode
-		} else if (mode == 0x4e) {
-			// LOW mode always uses page 02
-			current_page = 2;
-			pagechange[9] = 0x02;
-			HAL_UART_Transmit(&huart3, pagechange, 10, 10);
-			send_low_to_display();
-		}
-
-		previous_mode = mode;
-	}
-
-	if (low != previous_low) {
-		previous_low = low;
-		// NEW: Map 0-200 to icon 0-100
-		icon_id = low / 2;
-		icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
-		icon_array[1] = icon_id & 0xFF;         // low byte
-		TxData[4] = 0x20;
-		TxData[5] = 0x02;
-		TxData[6] = icon_array[0];
-		TxData[7] = icon_array[1];
-		HAL_UART_Transmit(&huart3, TxData, 8, 10);
-
-		// Update display variable icon
-		send_low_to_display();
-	}
+        // Update display variable icon
+        send_low_to_display();
+    }
 }
 
 void debouncing(void) {
-	if (pa7_pending) //only enter if interupt is raised and no debounce limit has reached
-	{
-		if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) //only eneter debounce limit is reached
-		{
-			pa7_pending = 0;         //clear interupt raised flag
+    if (pa7_pending) //only enter if interrupt is raised and no debounce limit has reached
+    {
+        if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) //only enter debounce limit is reached
+        {
+            pa7_pending = 0;         //clear interrupt raised flag
 
-			// Read stable pin state AFTER bounce settled
-			footswitch =
-					(HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET);
-		}
-	}
-	if (pb0_pending) {
-		if ((HAL_GetTick() - pb0_last_irq) >= DEBOUNCE_MS) {  // FIXED: use pb0_last_irq instead of pa7_last_irq
-			pb0_pending = 0;
+            // Read stable pin state AFTER bounce settled
+            footswitch =
+                    (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET);
+        }
+    }
+    if (pb0_pending) {
+        if ((HAL_GetTick() - pb0_last_irq) >= DEBOUNCE_MS) {
+            pb0_pending = 0;
 
-			// Read stable pin state AFTER bounce settled
-			active = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_RESET);
-		}
-	}
+            // Read stable pin state AFTER bounce settled
+            active = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_RESET);
+        }
+    }
 }
 
 void hv_adc_reading(void)
@@ -1095,119 +1166,119 @@ void hv_adc_reading(void)
 }
 
 void bi_hi_pwm(uint16_t dataa) {
-	switch (dataa) {
-	case 0:
-		TIM3->CCR1 = 0;
-		break;
-	case 1:
-		TIM3->CCR1 = 102;
-		break;
-	case 2:
-		TIM3->CCR1 = 186;
-		break;
-	case 3:
-		TIM3->CCR1 = 246;
-		break;
-	case 4:
-		TIM3->CCR1 = 307;
-		break;
-	case 5:
-		TIM3->CCR1 = 353;
-		break;
-	case 6:
-		TIM3->CCR1 = 384;
-		break;
-	case 7:
-		TIM3->CCR1 = 423;
-		break;
-	case 8:
-		TIM3->CCR1 = 458;
-		break;
-	case 9:
-		TIM3->CCR1 = 496;
-		break;
-	case 10:
-		TIM3->CCR1 = 524;
-		break;
-	case 11:
-		TIM3->CCR1 = 544;
-		break;
-	case 12:
-		TIM3->CCR1 = 583;
-		break;
-	case 13:
-		TIM3->CCR1 = 609;
-		break;
-	case 14:
-		TIM3->CCR1 = 630;
-		break;
-	case 15:
-		TIM3->CCR1 = 655;
-		break;
-	case 16:
-		TIM3->CCR1 = 673;
-		break;
-	case 17:
-		TIM3->CCR1 = 697;
-		break;
-	case 18:
-		TIM3->CCR1 = 717;
-		break;
-	case 19:
-		TIM3->CCR1 = 742;
-		break;
-	case 20:
-		TIM3->CCR1 = 754;
-		break;
-	case 21:
-		TIM3->CCR1 = 781;
-		break;
-	case 22:
-		TIM3->CCR1 = 803;
-		break;
-	case 23:
-		TIM3->CCR1 = 812;
-		break;
-	case 24:
-		TIM3->CCR1 = 836;
-		break;
-	case 25:
-		TIM3->CCR1 = 856;
-		break;
-	case 26:
-		TIM3->CCR1 = 867;
-		break;
-	case 27:
-		TIM3->CCR1 = 889;
-		break;
-	case 28:
-		TIM3->CCR1 = 901;
-		break;
-	case 29:
-		TIM3->CCR1 = 930;
-		break;
-	case 30:
-		TIM3->CCR1 = 948;
-		break;
-	case 31:
-		TIM3->CCR1 = 960;
-		break;
-	case 32:
-		TIM3->CCR1 = 981;
-		break;
-	case 33:
-		TIM3->CCR1 = 989;
-		break;
-	case 34:
-		TIM3->CCR1 = 998;
-		break;
-	case 35:
-		TIM3->CCR1 = 998;
-		break;
-	default:
-		TIM3->CCR1 = 0;
-		break;
-	}
+    switch (dataa) {
+    case 0:
+        TIM3->CCR1 = 0;
+        break;
+    case 1:
+        TIM3->CCR1 = 102;
+        break;
+    case 2:
+        TIM3->CCR1 = 186;
+        break;
+    case 3:
+        TIM3->CCR1 = 246;
+        break;
+    case 4:
+        TIM3->CCR1 = 307;
+        break;
+    case 5:
+        TIM3->CCR1 = 353;
+        break;
+    case 6:
+        TIM3->CCR1 = 384;
+        break;
+    case 7:
+        TIM3->CCR1 = 423;
+        break;
+    case 8:
+        TIM3->CCR1 = 458;
+        break;
+    case 9:
+        TIM3->CCR1 = 496;
+        break;
+    case 10:
+        TIM3->CCR1 = 524;
+        break;
+    case 11:
+        TIM3->CCR1 = 544;
+        break;
+    case 12:
+        TIM3->CCR1 = 583;
+        break;
+    case 13:
+        TIM3->CCR1 = 609;
+        break;
+    case 14:
+        TIM3->CCR1 = 630;
+        break;
+    case 15:
+        TIM3->CCR1 = 655;
+        break;
+    case 16:
+        TIM3->CCR1 = 673;
+        break;
+    case 17:
+        TIM3->CCR1 = 697;
+        break;
+    case 18:
+        TIM3->CCR1 = 717;
+        break;
+    case 19:
+        TIM3->CCR1 = 742;
+        break;
+    case 20:
+        TIM3->CCR1 = 754;
+        break;
+    case 21:
+        TIM3->CCR1 = 781;
+        break;
+    case 22:
+        TIM3->CCR1 = 803;
+        break;
+    case 23:
+        TIM3->CCR1 = 812;
+        break;
+    case 24:
+        TIM3->CCR1 = 836;
+        break;
+    case 25:
+        TIM3->CCR1 = 856;
+        break;
+    case 26:
+        TIM3->CCR1 = 867;
+        break;
+    case 27:
+        TIM3->CCR1 = 889;
+        break;
+    case 28:
+        TIM3->CCR1 = 901;
+        break;
+    case 29:
+        TIM3->CCR1 = 930;
+        break;
+    case 30:
+        TIM3->CCR1 = 948;
+        break;
+    case 31:
+        TIM3->CCR1 = 960;
+        break;
+    case 32:
+        TIM3->CCR1 = 981;
+        break;
+    case 33:
+        TIM3->CCR1 = 989;
+        break;
+    case 34:
+        TIM3->CCR1 = 998;
+        break;
+    case 35:
+        TIM3->CCR1 = 998;
+        break;
+    default:
+        TIM3->CCR1 = 0;
+        break;
+    }
 }
 
 void lowfunction(uint16_t dataa) {
@@ -1472,10 +1543,10 @@ void lowfunction(uint16_t dataa) {
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
-	__disable_irq();
-	while (1) {
-	}
+    /* User can add his own implementation to report the HAL error return state */
+    __disable_irq();
+    while (1) {
+    }
   /* USER CODE END Error_Handler_Debug */
 }
 
