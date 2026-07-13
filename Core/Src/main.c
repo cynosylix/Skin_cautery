@@ -34,21 +34,31 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define TIM3_ARR 2999
-#define INPUT_MIN_HIBI  0x00//lower limit of pwm wave gen hv_pwm
-#define INPUT_MAX_HIBI 0x23//higher limit of pwm wave gen hv_pwm
-#define INPUT_MIN_LOW  0x00//lower limit of pwm wave gen hv_pwm
-#define INPUT_MAX_LOW  0xc8//higher limit of pwm wave gen hv_pwm
-#define DEBOUNCE_MS 20   // safe for most mechanical buttons
+#define INPUT_MIN_HIBI  0x00
+#define INPUT_MAX_HIBI 0x23
+#define INPUT_MIN_LOW  0x00
+#define INPUT_MAX_LOW  0xc8
+#define DEBOUNCE_MS 20
 #define HIGH_THRESHOLD_CH0 1.7f
 #define LOW_THRESHOLD_CH0  0.0f
 #define HIGH_THRESHOLD_CH1 3.2f
 #define LOW_THRESHOLD_CH1  0.0f
 
 #define ADC_MAX_VALUE   4095.0f
-#define VDDA_VOLTAGE    3.3f    // change ONLY if VDDA is different
-#define VP_LOW_VALUE    0x1000  // DWIN variable address for low value
-#define VP_VAR_ICON     0x2000  // DWIN variable address for variable icon
-#define MIN_VAR_ICON_VALUE 76   // Minimum value for variable icon
+#define VDDA_VOLTAGE    3.3f
+#define VP_LOW_VALUE         0x1000  // DWIN variable address for low value
+#define VP_LOW_DATA          0x3002  // DWIN variable address for low numeric display
+#define VP_VAR_ICON          0x2000  // DWIN variable address for variable icon
+#define VP_MODE              0x3000  // DWIN variable address for mode (was wrongly 0x2000)
+#define VP_MODE_DATA         0x3003  // DWIN variable address (high/bipolar/low page value)
+#define EEPROM_ADDR_LOW      0x002A  // EEPROM storage for VP 0x1000 low value
+#define EEPROM_ADDR_VP3003   0x002C  // EEPROM storage for VP 0x3003
+#define LOW_VALUE_MAX        200     // Maximum low value (INPUT_MAX_LOW)
+#define BOOT_VAR_ICON_VALUE  76      // Icon ID sent to VP 0x2000 after page 2 loads
+#define MIN_VAR_ICON_VALUE   76      // Minimum allowed variable icon value
+#define VAR_ICON_KEY_MAX     78      // 3 return keys select icons 76, 77, 78
+#define MODE_KEY_HIGH        0x004F  // VP 0x2000 return key — high mode (page 1)
+#define MODE_KEY_BIPOLAR     0x004D  // VP 0x2000 return key — bipolar mode (page 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,10 +81,9 @@ UART_HandleTypeDef huart3;
 /* USER CODE BEGIN PV */
 int count;
 int test;
-//uint32_t ccr = 0;
-uint8_t RxData[9];
-uint8_t rxBuffer[9];
-uint8_t rxData[9];
+uint8_t RxData[12];
+uint8_t rxBuffer[12];
+uint8_t rxData[12];
 volatile uint16_t rxIndex = 0;
 static uint8_t uart_rx_started = 0;
 uint16_t address, dataa, mode, high, bipolar, low, icon_id, brightnes,
@@ -86,23 +95,26 @@ bool eeprom_err = false;
 uint32_t err = 0;
 bool ch_pg_flag = false;
 uint8_t TxData[8] = { 0x5A, 0xA5, 0x05, 0x82, 0x50, 0x02, 0x00, 0x0a };
-uint8_t data[2], modee[2], highh[2], bipolarr[2], loww[2], icon_array[2],
+uint8_t data[2], modee[2], highh[2], bipolarr[2], loww[2], vp3003w[2], icon_array[2],
 		brightness[2], current_page_array[2];
+uint16_t vp3003_val = 0;
 uint16_t prev_address;
 uint16_t prev_dataa;
-uint16_t previous_low;
-// static uint32_t last = 0;
+uint16_t previous_low = 0;
+volatile uint8_t dwin_pkt_ready = 0;
+static uint32_t low_save_enable_tick = 0;
+static uint32_t low_display_push_until = 0;
+static uint32_t vp3003_save_enable_tick = 0;
+static uint32_t vp3003_page1_restore_until = 0;
+static uint8_t vp3003_user_touched = 0;
 uint32_t delta = 0;
 float frequency = 0.0;
 volatile uint8_t footswitch = 0;
 volatile uint8_t active = 0;
 volatile uint32_t pa7_last_irq = 0;
 volatile uint8_t pa7_pending = 0;
-//volatile uint8_t alert_hv = 0;
 volatile uint32_t pb0_last_irq = 0;
 volatile uint8_t pb0_pending = 0;
-//uint32_t last_adc_tick = 0;
-//uint16_t adc_raw = 0;
 uint8_t pagechange[10] = { 0x5A, 0xA5, 0x07, 0x82, 0x00, 0x84, 0x5A, 0x01, 0x00, 0x01 };
 uint8_t mapped_duty = 0;
 
@@ -115,11 +127,10 @@ uint8_t alert_gate = 0;
 
 float ch1_voltage;
 float ch0_voltage=1.6f;
-//uint16_t addr = 0x0100;   // not 0100
 
 // Variable icon storage (VP 0x2000)
-uint16_t var_icon_value = 76;  // Default minimum value
-uint8_t var_icon_data[2] = {0x00, 0x4C};  // 76 in hex (0x004C)
+uint16_t var_icon_value = BOOT_VAR_ICON_VALUE;
+uint8_t var_icon_data[2] = {0x00, 0x4C};  // 76 = 0x004C
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -144,42 +155,49 @@ void send_low_to_display(void);
 void send_page_change(uint8_t page_num);
 void dwin_boot_to_page(uint8_t page_num);
 void dwin_uart_rx_start(void);
+void low_value_user_changed(uint16_t new_low);
 void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low);
+void dwin_set_var_icon(uint16_t icon_id);
 void send_var_icon_to_display(void);
+void dwin_apply_boot_var_icon(void);
+void eeprom_read_low_value(void);
+void eeprom_save_low_value(void);
+void low_sync_both_vps(void);
+void low_push_display_from_eeprom(void);
+void eeprom_read_vp3003_value(void);
+void eeprom_save_vp3003_value(void);
+void vp3003_send_to_display(void);
+void vp3003_user_changed(uint16_t new_val);
+void dwin_refresh_page2_values(void);
+void dwin_open_page2(void);
+void dwin_refresh_page1_values(void);
+void dwin_open_page1(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART3) {
-		// Append the received byte to the buffer
-		if (rxIndex < sizeof(rxData)) {  // Prevent buffer overflow
+		if (rxIndex < sizeof(rxData)) {
 			rxData[rxIndex++] = rxBuffer[0];
 		}
 
-		// Continue receiving more data
 		HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
 
-		// Check if we have a complete packet (minimum 5 bytes for DWIN)
 		if (rxIndex >= 5) {
-			// Check for DWIN frame header 0x5A 0xA5
 			if (rxData[0] == 0x5A && rxData[1] == 0xA5) {
-				uint8_t data_len = rxData[2];  // Data length
-				uint8_t total_len = data_len + 3;  // Total frame length (header + data + CRC)
+				uint8_t data_len = rxData[2];
+				uint8_t total_len = data_len + 3;
 
-				// Check if we have received the complete frame
 				if (rxIndex >= total_len) {
-					// Copy the complete frame to RxData
-					for(int i = 0; i < total_len && i < 9; i++) {
+					for(int i = 0; i < total_len && i < (int)sizeof(RxData); i++) {
 						RxData[i] = rxData[i];
 					}
-
-					// Clear buffer and reset index
+					dwin_pkt_ready = 1;
 					memset(rxData, 0, sizeof(rxData));
 					rxIndex = 0;
 				}
 			} else {
-				// Invalid frame, reset buffer
 				memset(rxData, 0, sizeof(rxData));
 				rxIndex = 0;
 			}
@@ -187,26 +205,115 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	}
 }
 
-//-----------------------------------------------------interrupt reading if button is pressed-------------------------------
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	if (GPIO_Pin == GPIO_PIN_7) {
-		pa7_last_irq = HAL_GetTick();  // timestamp
-		pa7_pending = 1;              // mark for debounce
+		pa7_last_irq = HAL_GetTick();
+		pa7_pending = 1;
 	}
 
 	if (GPIO_Pin == GPIO_PIN_0) {
-		pb0_last_irq = HAL_GetTick();  // timestamp
-		pb0_pending = 1;              // mark for debounce
+		pb0_last_irq = HAL_GetTick();
+		pb0_pending = 1;
 	}
 }
 
-// Start UART receive once (callback chain keeps it running)
 void dwin_uart_rx_start(void) {
     if (!uart_rx_started) {
         rxIndex = 0;
         memset(rxData, 0, sizeof(rxData));
         HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
         uart_rx_started = 1;
+    }
+}
+
+void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
+    *valid = 0;
+    if (RxData[0] != 0x5A || RxData[1] != 0xA5 || RxData[2] < 3) {
+        return;
+    }
+
+    *addr = (uint16_t)(((uint16_t)RxData[4] << 8) | RxData[5]);
+    uint16_t max_val = LOW_VALUE_MAX;
+    if (*addr == VP_MODE_DATA) {
+        if (mode == 0x4f || mode == 0x4d) {
+            max_val = INPUT_MAX_HIBI;
+        }
+    } else if (*addr == VP_VAR_ICON) {
+        max_val = MODE_KEY_HIGH;
+    }
+
+    uint8_t cmd = RxData[3];
+    uint8_t len = RxData[2];
+
+    if (cmd == 0x82 && len >= 5) {
+        uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+        uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+        if (be <= max_val) {
+            *data = be;
+            *valid = 1;
+        } else if (le <= max_val) {
+            *data = le;
+            *valid = 1;
+        }
+        return;
+    }
+
+    if (cmd == 0x83) {
+        uint16_t c1 = 0, c2 = 0, c3 = 0;
+        if (len >= 6) {
+            c1 = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[8]);
+            c2 = (uint16_t)(((uint16_t)RxData[8] << 8) | RxData[7]);
+            c3 = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+        } else if (len >= 4) {
+            c1 = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            c2 = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+        }
+        if (c1 <= max_val) {
+            *data = c1;
+            *valid = 1;
+        } else if (c2 <= max_val) {
+            *data = c2;
+            *valid = 1;
+        } else if (c3 <= max_val) {
+            *data = c3;
+            *valid = 1;
+        }
+    }
+}
+
+void low_value_user_changed(uint16_t new_low) {
+    if (HAL_GetTick() < low_save_enable_tick) {
+        return;
+    }
+    if (new_low > LOW_VALUE_MAX) {
+        new_low = LOW_VALUE_MAX;
+    }
+
+    /* DWIN 22.bin floods VP 0x1000 with max (200) on page load — never save that */
+    if ((new_low == LOW_VALUE_MAX || new_low == 110) && low < (LOW_VALUE_MAX - 3)) {
+        low_sync_both_vps();
+        return;
+    }
+
+    if (new_low == low) {
+        return;
+    }
+
+    low = new_low;
+    loww[0] = (uint8_t)((low >> 8) & 0xFF);
+    loww[1] = (uint8_t)(low & 0xFF);
+    eeprom_save_low_value();
+    previous_low = low;
+
+    low_sync_both_vps();
+
+    icon_id = low / 2;
+    icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
+    icon_array[1] = (uint8_t)(icon_id & 0xFF);
+    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+
+    if (mode == 0x4e && ((footswitch) || (active))) {
+        lowfunction(low);
     }
 }
 
@@ -225,14 +332,14 @@ void send_page_change(uint8_t page_num) {
     };
     dwin_uart_send(cmd, 10);
     HAL_Delay(30);
+    current_page = page_num;
 }
 
-// Show 00.bmp, then retry page change until DWIN UART is ready
 void dwin_boot_to_page(uint8_t page_num) {
-    HAL_Delay(3000);
-    for (uint8_t i = 0; i < 15; i++) {
+    HAL_Delay(3000);  // show 00.bmp for 3 seconds
+    for (uint8_t i = 0; i < 3; i++) {
         send_page_change(page_num);
-        HAL_Delay(400);
+        HAL_Delay(100);
     }
 }
 
@@ -245,13 +352,307 @@ void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, 
     HAL_Delay(20);
 }
 
+void dwin_set_var_icon(uint16_t icon_id) {
+    var_icon_value = icon_id;
+    var_icon_data[0] = (uint8_t)((icon_id >> 8) & 0xFF);
+    var_icon_data[1] = (uint8_t)(icon_id & 0xFF);
+}
+
 void send_var_icon_to_display(void) {
     uint8_t cmd[8] = {
-        0x5A, 0xA5, 0x05, 0x82, 0x20, 0x00,
+        0x5A, 0xA5, 0x05, 0x82,
+        (uint8_t)((VP_VAR_ICON >> 8) & 0xFF),
+        (uint8_t)(VP_VAR_ICON & 0xFF),
         var_icon_data[0], var_icon_data[1]
     };
     dwin_uart_send(cmd, 8);
     HAL_Delay(20);
+}
+
+void eeprom_read_low_value(void) {
+    low = 0;
+    loww[0] = 0x00;
+    loww[1] = 0x00;
+
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 3, 50) != HAL_OK) {
+        return;
+    }
+
+    if (HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, EEPROM_ADDR_LOW, I2C_MEMADD_SIZE_16BIT,
+                         loww, 2, 1000) != HAL_OK) {
+        loww[0] = 0x00;
+        loww[1] = 0x00;
+        return;
+    }
+    HAL_Delay(10);
+
+    if (loww[0] == 0xFF && loww[1] == 0xFF) {
+        eeprom_save_low_value();
+        return;
+    }
+
+    low = (uint16_t)((loww[0] << 8) | loww[1]);
+    if (low > LOW_VALUE_MAX) {
+        low = LOW_VALUE_MAX;
+        loww[0] = (uint8_t)((low >> 8) & 0xFF);
+        loww[1] = (uint8_t)(low & 0xFF);
+        eeprom_save_low_value();
+    }
+}
+
+void eeprom_save_low_value(void) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_LOW, I2C_MEMADD_SIZE_16BIT,
+                          loww, 2, 1000);
+        HAL_Delay(10);
+    } else {
+        eeprom_err = true;
+    }
+}
+
+void eeprom_read_vp3003_value(void) {
+    vp3003_val = 0;
+    vp3003w[0] = 0x00;
+    vp3003w[1] = 0x00;
+
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 3, 50) != HAL_OK) {
+        return;
+    }
+
+    if (HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, EEPROM_ADDR_VP3003, I2C_MEMADD_SIZE_16BIT,
+                         vp3003w, 2, 1000) != HAL_OK) {
+        return;
+    }
+    HAL_Delay(10);
+
+    if (vp3003w[0] == 0xFF && vp3003w[1] == 0xFF) {
+        if (mode == 0x4f) {
+            vp3003_val = high;
+            vp3003w[0] = highh[0];
+            vp3003w[1] = highh[1];
+        } else if (mode == 0x4d) {
+            vp3003_val = bipolar;
+            vp3003w[0] = bipolarr[0];
+            vp3003w[1] = bipolarr[1];
+        } else {
+            vp3003_val = low;
+            vp3003w[0] = loww[0];
+            vp3003w[1] = loww[1];
+        }
+        eeprom_save_vp3003_value();
+        return;
+    }
+
+    vp3003_val = (uint16_t)((vp3003w[0] << 8) | vp3003w[1]);
+
+    if (mode == 0x4f) {
+        if (vp3003_val > INPUT_MAX_HIBI) {
+            vp3003_val = INPUT_MAX_HIBI;
+        }
+        high = vp3003_val;
+        highh[0] = vp3003w[0];
+        highh[1] = vp3003w[1];
+    } else if (mode == 0x4d) {
+        if (vp3003_val > INPUT_MAX_HIBI) {
+            vp3003_val = INPUT_MAX_HIBI;
+        }
+        bipolar = vp3003_val;
+        bipolarr[0] = vp3003w[0];
+        bipolarr[1] = vp3003w[1];
+    } else if (vp3003_val > LOW_VALUE_MAX) {
+        vp3003_val = LOW_VALUE_MAX;
+        vp3003w[0] = (uint8_t)((vp3003_val >> 8) & 0xFF);
+        vp3003w[1] = (uint8_t)(vp3003_val & 0xFF);
+        eeprom_save_vp3003_value();
+    }
+}
+
+void eeprom_save_vp3003_value(void) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_VP3003, I2C_MEMADD_SIZE_16BIT,
+                          vp3003w, 2, 1000);
+        HAL_Delay(10);
+    } else {
+        eeprom_err = true;
+    }
+}
+
+static uint8_t vp3003_is_page_default(uint16_t val) {
+    if (val == 0) {
+        return 1;
+    }
+    if ((mode == 0x4f || mode == 0x4d) && val == INPUT_MAX_HIBI) {
+        return 1;
+    }
+    if (mode == 0x4e && (val == LOW_VALUE_MAX || val == 110)) {
+        return 1;
+    }
+    return 0;
+}
+
+static void vp3003_stop_push(void) {
+    vp3003_page1_restore_until = 0;
+    vp3003_save_enable_tick = 0;
+}
+
+static void vp3003_apply_mode_key(uint16_t new_mode) {
+    mode = new_mode;
+    modee[0] = (uint8_t)((new_mode >> 8) & 0xFF);
+    modee[1] = (uint8_t)(new_mode & 0xFF);
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x000A,
+                          I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
+        HAL_Delay(10);
+    } else {
+        eeprom_err = true;
+    }
+    previous_mode = new_mode;
+    send_variable_data(0x30, 0x00, modee[0], modee[1]);
+    current_page = 1;
+    eeprom_read_vp3003_value();
+    dwin_refresh_page1_values();
+}
+
+static uint8_t vp3003_is_mode_return_key(uint16_t val) {
+    return (val == MODE_KEY_HIGH || val == 0x4f ||
+            val == MODE_KEY_BIPOLAR || val == 0x4d);
+}
+
+static void vp3003_handle_page1_rx(uint16_t new_val) {
+    if (current_page != 1) {
+        current_page = 1;
+        dwin_refresh_page1_values();
+        if (vp3003_is_page_default(new_val)) {
+            return;
+        }
+    }
+    if (HAL_GetTick() < vp3003_save_enable_tick && vp3003_is_page_default(new_val)) {
+        vp3003_send_to_display();
+        return;
+    }
+    vp3003_user_touched = 1;
+    vp3003_stop_push();
+    vp3003_user_changed(new_val);
+}
+
+void vp3003_send_to_display(void) {
+    send_variable_data((uint8_t)((VP_MODE_DATA >> 8) & 0xFF),
+                       (uint8_t)(VP_MODE_DATA & 0xFF),
+                       vp3003w[0], vp3003w[1]);
+}
+
+void vp3003_user_changed(uint16_t new_val) {
+    if (mode == 0x4f || mode == 0x4d) {
+        if (new_val > INPUT_MAX_HIBI) {
+            new_val = INPUT_MAX_HIBI;
+        }
+        if (new_val == INPUT_MAX_HIBI && vp3003_val < (INPUT_MAX_HIBI - 3)) {
+            return;
+        }
+        if (mode == 0x4f) {
+            high = new_val;
+            highh[0] = (uint8_t)((new_val >> 8) & 0xFF);
+            highh[1] = (uint8_t)(new_val & 0xFF);
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0014,
+                I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
+                HAL_Delay(10);
+            }
+        } else {
+            bipolar = new_val;
+            bipolarr[0] = (uint8_t)((new_val >> 8) & 0xFF);
+            bipolarr[1] = (uint8_t)(new_val & 0xFF);
+            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0018,
+                I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
+                HAL_Delay(10);
+            }
+        }
+    } else {
+        if (new_val > LOW_VALUE_MAX) {
+            new_val = LOW_VALUE_MAX;
+        }
+        if ((new_val == LOW_VALUE_MAX || new_val == 110) && vp3003_val < (LOW_VALUE_MAX - 3)) {
+            return;
+        }
+    }
+
+    if (new_val == vp3003_val) {
+        return;
+    }
+
+    vp3003_val = new_val;
+    vp3003w[0] = (uint8_t)((vp3003_val >> 8) & 0xFF);
+    vp3003w[1] = (uint8_t)(vp3003_val & 0xFF);
+    eeprom_save_vp3003_value();
+}
+
+void low_sync_both_vps(void) {
+    uint8_t dh = (uint8_t)((low >> 8) & 0xFF);
+    uint8_t dl = (uint8_t)(low & 0xFF);
+
+    send_variable_data((uint8_t)((VP_LOW_VALUE >> 8) & 0xFF),
+                       (uint8_t)(VP_LOW_VALUE & 0xFF), dh, dl);
+    send_variable_data((uint8_t)((VP_LOW_DATA >> 8) & 0xFF),
+                       (uint8_t)(VP_LOW_DATA & 0xFF), dh, dl);
+    HAL_Delay(30);
+    send_variable_data((uint8_t)((VP_LOW_VALUE >> 8) & 0xFF),
+                       (uint8_t)(VP_LOW_VALUE & 0xFF), dh, dl);
+}
+
+void low_push_display_from_eeprom(void) {
+    eeprom_read_low_value();
+    low_sync_both_vps();
+    icon_id = low / 2;
+    icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
+    icon_array[1] = (uint8_t)(icon_id & 0xFF);
+    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+    previous_low = low;
+}
+
+void low_send_to_display(void) {
+    low_push_display_from_eeprom();
+}
+
+void dwin_refresh_page2_values(void) {
+    low_push_display_from_eeprom();
+    send_var_icon_to_display();
+    low_save_enable_tick = HAL_GetTick() + 1000;
+    low_display_push_until = HAL_GetTick() + 2500;
+}
+
+void dwin_refresh_page1_values(void) {
+    eeprom_read_vp3003_value();
+    vp3003_user_touched = 0;
+    vp3003_save_enable_tick = HAL_GetTick() + 2500;
+    vp3003_page1_restore_until = HAL_GetTick() + 5000;
+    vp3003_send_to_display();
+}
+
+void dwin_open_page1(void) {
+    send_page_change(0x01);
+    HAL_Delay(700);
+    dwin_refresh_page1_values();
+    HAL_Delay(400);
+    vp3003_send_to_display();
+}
+
+void dwin_open_page2(void) {
+    send_page_change(0x02);
+    HAL_Delay(400);
+    dwin_refresh_page2_values();
+}
+
+void dwin_apply_boot_var_icon(void) {
+    dwin_set_var_icon(BOOT_VAR_ICON_VALUE);
+    send_var_icon_to_display();
+    send_var_icon_to_display();
+
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
+                          var_icon_data, 2, 1000);
+        HAL_Delay(10);
+    }
 }
 /* USER CODE END 0 */
 
@@ -268,21 +669,18 @@ int main(void)
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
@@ -293,108 +691,74 @@ int main(void)
   MX_TIM1_Init();
 
   /* USER CODE BEGIN 2 */
-  HAL_ADCEx_Calibration_Start(&hadc1); // MUST be before DMA start
+  HAL_ADCEx_Calibration_Start(&hadc1);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_dma_buf, 2);
 
   HAL_Delay(200);
-  dwin_boot_to_page(0x02);
-  dwin_uart_rx_start();
 
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // Variable PWM
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); // Constant PWM
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
-  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300); //70%
+  low_save_enable_tick = HAL_GetTick() + 30000;
 
-//-----------------------------------------------------for read eeprom value and transmit to display and store ram---------------------------------
+  /* Read EEPROM before any display UART (so we know the real low value) */
+  eeprom_read_low_value();
+
   HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0200, I2C_MEMADD_SIZE_16BIT,
-          current_page_array, 2, 1000); //retrive current page of low page(0-10)page2,(10-20)page7 value
+          current_page_array, 2, 1000);
   HAL_Delay(10);
-  current_page = (current_page_array[0] << 8) | current_page_array[1]; //currentpage number
-  // Ensure current_page is always 2 for LOW mode (page 07 removed)
-  if(current_page != 2) {
+  current_page = (current_page_array[0] << 8) | current_page_array[1];
+  if (current_page != 2) {
       current_page = 2;
   }
 
-//---------------------------------------------------------------------
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2,
-          1000); //retrive modes value
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
   HAL_Delay(10);
   mode = (modee[0] << 8) | modee[1];
 
-  // Send mode to display
-  send_variable_data(0x20, 0x00, modee[0], modee[1]);
-
-//-----------------------------------------------------------------------------
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0014, I2C_MEMADD_SIZE_16BIT, highh, 2,
-          1000); //retrive high value
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0014, I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
   HAL_Delay(10);
   high = (highh[0] << 8) | highh[1];
 
-//-------------------------------------------------------------------------------
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0018, I2C_MEMADD_SIZE_16BIT, bipolarr,
-          2, 1000); //retrive bipolar value
+  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0018, I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
   HAL_Delay(10);
   bipolar = (bipolarr[0] << 8) | bipolarr[1];
 
-//----------------------------------------------perform corresponding data uploads depending on modes---------------------------------
-  if (mode == 0x4f) {
-      send_variable_data(0x30, 0x03, highh[0], highh[1]); //send high mode's variable data
-      send_variable_data(0x20, 0x01, highh[0], highh[1]); //send loading of high mode
-  } else if (mode == 0x4d) {
-      send_variable_data(0x30, 0x03, bipolarr[0], bipolarr[1]); //send bipolar mode's variable data
-      send_variable_data(0x20, 0x01, bipolarr[0], bipolarr[1]); //send loading of bipolar mode
-  }
-
-//--------------------------------------------------------------------------------------
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x002A, I2C_MEMADD_SIZE_16BIT, loww, 2,
-          1000);
-  HAL_Delay(10);
-  low = (loww[0] << 8) | loww[1];
-
-  // Send low value to display
-  send_variable_data(0x30, 0x02, loww[0], loww[1]);
-
-  // NEW ICON MAPPING: Map 0-200 to icon 0-100
-  icon_id = low / 2;  // 0-200 maps to 0-100
-
-  icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
-  icon_array[1] = icon_id & 0xFF;         // low byte
-  send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
-
-  // Send current low value to display variable icon at 0x1000
-  send_low_to_display();
-
-  // Read variable icon value from EEPROM (VP 0x2000)
-  // If value < 76, set it to 76 and save back
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
-          var_icon_data, 2, 1000);
-  HAL_Delay(10);
-  var_icon_value = (var_icon_data[0] << 8) | var_icon_data[1];
-
-  // Enforce minimum value of 76
-  if (var_icon_value < MIN_VAR_ICON_VALUE) {
-      var_icon_value = MIN_VAR_ICON_VALUE;
-      var_icon_data[0] = (var_icon_value >> 8) & 0xFF;
-      var_icon_data[1] = var_icon_value & 0xFF;
-      // Save corrected value back to EEPROM
-      HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
-                        var_icon_data, 2, 1000);
-      HAL_Delay(10);
-  }
-
-  // Send variable icon value to display at VP 0x2000
-  send_var_icon_to_display();
+  eeprom_read_vp3003_value();
 
   HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0100, I2C_MEMADD_SIZE_16BIT,
           brightness, 2, 1000);
+  HAL_Delay(10);
   brightnes = (brightness[0] << 8) | brightness[1];
+
+  /* Page 2 splash, then push EEPROM low to VP 0x1000 BEFORE UART RX */
+  dwin_boot_to_page(0x02);
+  HAL_Delay(400);
+
+  dwin_set_var_icon(BOOT_VAR_ICON_VALUE);
+  send_var_icon_to_display();
+  low_sync_both_vps();
+  HAL_Delay(100);
+  low_sync_both_vps();
+
+  icon_id = low / 2;
+  icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
+  icon_array[1] = (uint8_t)(icon_id & 0xFF);
+  send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+
+  dwin_uart_rx_start();
+
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300);
+
+  send_variable_data(0x30, 0x00, modee[0], modee[1]);
+
   send_variable_data(0x00, 0x82, brightness[0], brightness[1]);
 
-//---------------------------------------------------------------------------------------------------------------------------------------------------
-
-  // Upload display variables (page already set to 02.bmp during boot)
   current_page = 2;
+
+  dwin_apply_boot_var_icon();
+  dwin_refresh_page2_values();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -405,36 +769,54 @@ int main(void)
     /* USER CODE BEGIN 3 */
     HAL_Delay(1);
 
+    if (dwin_pkt_ready) {
+        dwin_pkt_ready = 0;
 
-    // Combine RxData[4] and RxData[5] into a 16-bit address
-    address = (RxData[4] << 8) | RxData[5]; //copy address from received display data
+        uint16_t rx_addr = 0;
+        uint16_t rx_data = 0;
+        uint8_t rx_valid = 0;
 
-    // Combine RxData[6] and RxData[7] into a 16-bit data
-    dataa = (RxData[6] << 8) | RxData[7]; //copy data from received display data
-
-    if ((address != prev_address) || (dataa != prev_dataa)) //to detect data or address is changed
-    {
-        number_eeprome_flag = true; //raise a flag if touch happens
-        prev_address = address; //remember past value
-        prev_dataa = dataa; //remember past value
+        dwin_rx_get_vp(&rx_addr, &rx_data, &rx_valid);
+        if (rx_valid) {
+            address = rx_addr;
+            dataa = rx_data;
+            number_eeprome_flag = true;
+            prev_address = address;
+            prev_dataa = dataa;
+        }
     }
 
-    count++; //counter to verify device is running
+    if (HAL_GetTick() < low_display_push_until) {
+        static uint32_t last_low_push = 0;
+        if (HAL_GetTick() - last_low_push >= 300) {
+            low_sync_both_vps();
+            last_low_push = HAL_GetTick();
+        }
+    }
 
-    save_reading(); //to save received data to corresponding spaces
-    send_loadings(); //if any data is changed we have to update GUI loading icon
+    if (current_page == 1 && !vp3003_user_touched &&
+        HAL_GetTick() < vp3003_page1_restore_until) {
+        static uint32_t last_vp3003_push = 0;
+        if (HAL_GetTick() - last_vp3003_push >= 400) {
+            vp3003_send_to_display();
+            last_vp3003_push = HAL_GetTick();
+        }
+    }
 
-    debouncing(); //debouncing logic
+    count++;
 
+    save_reading();
+    send_loadings();
+
+    debouncing();
     hv_adc_reading();
 
-    //--------------------------------------system working-----------------------------------------//
     if (((footswitch) || (active)) && (alert_hv == 0) && (alert_gate == 0)) {
 
         ch_pg_flag = true;
         HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3); //70%pwm
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); //audio
+        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
+        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
         HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
         switch (mode) {
@@ -465,22 +847,19 @@ int main(void)
     } else {
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
         HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_3);
-        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1); //audio
+        HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
         HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(GPIOA, highrly_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOA, biprly_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOA, lowrly_Pin, GPIO_PIN_RESET);
 
-        //-----------------------------return from settings-------------------------------/
         if (ch_pg_flag) {
             ch_pg_flag = false;
             if((alert_hv != 1) && (alert_gate != 1)) {
                 if ((mode == 0x4f) || (mode == 0x4d)) {
-                    send_page_change(0x01);
+                    dwin_open_page1();
                 } else {
-                    // LOW mode always uses page 02
-                    current_page = 2;
-                    send_page_change(0x02);
+                    dwin_open_page2();
                 }
             } else if(alert_hv == 1) {
                 send_page_change(0x08);
@@ -503,9 +882,6 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -515,7 +891,6 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
-    /* HSE crystal missing/bad: fall back to internal HSI clock */
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
     RCC_OscInitStruct.HSEState = RCC_HSE_OFF;
     RCC_OscInitStruct.HSIState = RCC_HSI_ON;
@@ -528,8 +903,6 @@ void SystemClock_Config(void)
     }
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -567,8 +940,6 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 1 */
 
-  /** Common config
-  */
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc1.Init.ContinuousConvMode = ENABLE;
@@ -581,8 +952,6 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-  */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES_5;
@@ -591,8 +960,6 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-  */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_2;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
@@ -841,11 +1208,8 @@ static void MX_USART3_UART_Init(void)
 static void MX_DMA_Init(void)
 {
 
-  /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
 
-  /* DMA interrupt init */
-  /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 
@@ -862,44 +1226,36 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, biprly_Pin|highrly_Pin|lowrly_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(hv_en_GPIO_Port, hv_en_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : biprly_Pin highrly_Pin lowrly_Pin */
   GPIO_InitStruct.Pin = biprly_Pin|highrly_Pin|lowrly_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA7 */
   GPIO_InitStruct.Pin = GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PB0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : hv_en_Pin */
   GPIO_InitStruct.Pin = hv_en_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(hv_en_GPIO_Port, &GPIO_InitStruct);
 
-  /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
@@ -913,37 +1269,52 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void send_low_to_display(void) {
-    uint8_t cmd[8] = {
-        0x5A, 0xA5, 0x05, 0x82, 0x10, 0x00,
-        (uint8_t)((low >> 8) & 0xFF), (uint8_t)(low & 0xFF)
-    };
-    dwin_uart_send(cmd, 8);
-    HAL_Delay(20);
+    low_sync_both_vps();
 }
 
 void save_reading(void) {
     if (number_eeprome_flag) {
         number_eeprome_flag = false;
 
-        // Handle variable icon at VP 0x2000
+        // ============== FIX: Handle variable icon at VP 0x2000 ==============
         if (address == VP_VAR_ICON) {
             uint16_t new_value = dataa;
 
-            // Enforce minimum value of 76
-            if (new_value < MIN_VAR_ICON_VALUE) {
-                new_value = MIN_VAR_ICON_VALUE;
-                // Send corrected value back to display
-                var_icon_data[0] = (new_value >> 8) & 0xFF;
-                var_icon_data[1] = new_value & 0xFF;
-                send_var_icon_to_display();
-            } else {
-                var_icon_data[0] = RxData[6];
-                var_icon_data[1] = RxData[7];
+            /* Page 1 mode return keys — select mode and restore VP 0x3003 from EEPROM */
+            if (current_page == 1 && vp3003_is_mode_return_key(new_value)) {
+                if (new_value == MODE_KEY_HIGH || new_value == 0x4f) {
+                    vp3003_apply_mode_key(0x4f);
+                } else {
+                    vp3003_apply_mode_key(0x4d);
+                }
+                return;
             }
 
-            var_icon_value = new_value;
+            if (new_value == var_icon_value) {
+                return;
+            }
 
-            // Save to EEPROM
+            // Page 2 only: return keys icons 76/77/78 — display updates itself
+            if (current_page == 2 &&
+                new_value >= MIN_VAR_ICON_VALUE && new_value <= VAR_ICON_KEY_MAX) {
+                dwin_set_var_icon(new_value);
+                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300,
+                    I2C_MEMADD_SIZE_16BIT, var_icon_data, 2, 1000);
+                    HAL_Delay(10);
+                } else {
+                    eeprom_err = true;
+                }
+                return;
+            }
+
+            // Spurious increment writes — ignore silently (re-send causes blink)
+            if (new_value < MIN_VAR_ICON_VALUE ||
+                (new_value <= 100 && new_value == (uint16_t)(low / 2))) {
+                return;
+            }
+
+            dwin_set_var_icon(new_value);
             if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
                 HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300,
                 I2C_MEMADD_SIZE_16BIT, var_icon_data, 2, 1000);
@@ -951,53 +1322,14 @@ void save_reading(void) {
             } else {
                 eeprom_err = true;
             }
-            return; // Exit after handling variable icon
+            return;
         }
 
-        // Handle DWIN variable icon at 0x1000 (Low value control)
-        if (address == VP_LOW_VALUE) {
-            uint16_t new_low = dataa;
-            // Limit the value to 0-200 range
-            if (new_low > 200) new_low = 200;
-
-            if (new_low != low) {
-                low = new_low;
-                loww[0] = (low >> 8) & 0xFF;
-                loww[1] = low & 0xFF;
-
-                // Save to EEPROM
-                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
-                    I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
-                    HAL_Delay(10);
-
-                    // Update PWM immediately if LOW mode is active
-                    if (mode == 0x4e && ((footswitch) || (active))) {
-                        lowfunction(low);
-                    }
-
-                    // NEW: Update display loading icon using new mapping (0-200 -> 0-100)
-                    icon_id = low / 2;  // Map 0-200 to 0-100
-                    icon_array[0] = (icon_id >> 8) & 0xFF;
-                    icon_array[1] = icon_id & 0xFF;
-                    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
-
-                    // Update display variable icon
-                    send_low_to_display();
-                } else {
-                    eeprom_err = true;
-                }
-            }
-            return; // Exit after handling low value
-        }
-
-        switch (address) {
-        case 0x2000:  //engineers screen password location - Note: 0x2000 now used for var icon
-            // This case may need to be removed or changed since we're using 0x2000 for var icon
-            // Keeping for backward compatibility but with different handling
+        // ============== FIX: Handle mode at VP 0x3000 ==============
+        if (address == VP_MODE) {
             mode = dataa;
-            modee[0] = RxData[6];
-            modee[1] = RxData[7];
+            modee[0] = (uint8_t)((dataa >> 8) & 0xFF);
+            modee[1] = (uint8_t)(dataa & 0xFF);
             if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
                 HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x000A,
                 I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
@@ -1005,63 +1337,33 @@ void save_reading(void) {
             } else {
                 eeprom_err = true;
             }
-            break;
-
-        case 0x3003:  //engineers screen password location
-            if (mode == 0x4f)  //same 3003 variable data guided to high variable
-            {
-                high = dataa;
-                highh[0] = RxData[6];
-                highh[1] = RxData[7];
-                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0014,
-                    I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
-                    HAL_Delay(10);
-                } else {
-                    eeprom_err = true;
-                }
+            if (mode == 0x4f || mode == 0x4d) {
+                current_page = 1;
+                eeprom_read_vp3003_value();
+                dwin_refresh_page1_values();
             }
-            if (mode == 0x4d) //same 3003 variable data guided to bipolar variable
-            {
-                bipolar = dataa;
-                bipolarr[0] = RxData[6];
-                bipolarr[1] = RxData[7];
-                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0018,
-                    I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
-                    HAL_Delay(10);
-                } else {
-                    eeprom_err = true;
-                }
-            }
-            break;
+            return;
+        }
 
-        case 0x3002:
-            low = dataa;
-            loww[0] = RxData[6];
-            loww[1] = RxData[7];
+        // VP 0x1000 or VP 0x3002 — save EEPROM and sync both VPs
+        if (address == VP_LOW_VALUE || address == VP_LOW_DATA) {
+            low_value_user_changed(dataa);
+            return;
+        }
 
-            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x002A,
-                I2C_MEMADD_SIZE_16BIT, loww, 2, 1000);
-                HAL_Delay(10);
+        // VP 0x3003 / page 1 value — restore from EEPROM on show, save on user change
+        if (address == VP_MODE_DATA) {
+            vp3003_handle_page1_rx(dataa);
+            return;
+        }
 
-                // Update icon
-                icon_id = low / 2;
-                icon_array[0] = (icon_id >> 8) & 0xFF;
-                icon_array[1] = icon_id & 0xFF;
-                send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
-                send_low_to_display();
-            } else {
-                eeprom_err = true;
-            }
-            break;
-
+        // Handle other addresses
+        switch (address) {
         case 0x82:
             test++;
             brightnes = dataa;
-            brightness[0] = RxData[6];
-            brightness[1] = RxData[7];
+            brightness[0] = (uint8_t)((dataa >> 8) & 0xFF);
+            brightness[1] = (uint8_t)(dataa & 0xFF);
             if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
                 HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0100,
                 I2C_MEMADD_SIZE_16BIT, brightness, 2, 1000);
@@ -1074,11 +1376,9 @@ void save_reading(void) {
         case 0x2001:
             if (dataa == 0x01) {
                 if ((mode == 0x4f) || (mode == 0x4d)) {
-                    send_page_change(0x01);
+                    dwin_open_page1();
                 } else if (mode == 0x4e) {
-                    // LOW mode always uses page 02
-                    current_page = 2;
-                    send_page_change(0x02);
+                    dwin_open_page2();
                 }
             }
             break;
@@ -1088,51 +1388,30 @@ void save_reading(void) {
 
 void send_loadings(void) {
     if (mode != previous_mode) {
-        if (mode == 0x4f) {
-            send_variable_data(0x30, 0x03, highh[0], highh[1]);
-            send_variable_data(0x20, 0x01, highh[0], highh[1]);
-        } else if (mode == 0x4d) {
-            send_variable_data(0x30, 0x03, bipolarr[0], bipolarr[1]);
-            send_variable_data(0x20, 0x01, bipolarr[0], bipolarr[1]);
-        } else if (mode == 0x4e) {
-            // LOW mode always uses page 02
-            current_page = 2;
-            send_page_change(0x02);
-            send_low_to_display();
+        if (mode == 0x4e) {
+            dwin_open_page2();
+        } else if (mode == 0x4f || mode == 0x4d) {
+            if (current_page == 1) {
+                eeprom_read_vp3003_value();
+                dwin_refresh_page1_values();
+            } else {
+                dwin_open_page1();
+            }
         }
         previous_mode = mode;
-    }
-
-    if (low != previous_low) {
-        previous_low = low;
-        // NEW: Map 0-200 to icon 0-100
-        icon_id = low / 2;
-        icon_array[0] = (icon_id >> 8) & 0xFF;  // high byte
-        icon_array[1] = icon_id & 0xFF;         // low byte
-        send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
-
-        // Update display variable icon
-        send_low_to_display();
     }
 }
 
 void debouncing(void) {
-    if (pa7_pending) //only enter if interrupt is raised and no debounce limit has reached
-    {
-        if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) //only enter debounce limit is reached
-        {
-            pa7_pending = 0;         //clear interrupt raised flag
-
-            // Read stable pin state AFTER bounce settled
-            footswitch =
-                    (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET);
+    if (pa7_pending) {
+        if ((HAL_GetTick() - pa7_last_irq) >= DEBOUNCE_MS) {
+            pa7_pending = 0;
+            footswitch = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_7) == GPIO_PIN_RESET);
         }
     }
     if (pb0_pending) {
         if ((HAL_GetTick() - pb0_last_irq) >= DEBOUNCE_MS) {
             pb0_pending = 0;
-
-            // Read stable pin state AFTER bounce settled
             active = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_RESET);
         }
     }
@@ -1144,13 +1423,12 @@ void hv_adc_reading(void)
     {
         last_adc_tick = HAL_GetTick();
 
-         adc_raw_ch1 = adc_dma_buf[0];  // Rank 1 → ADC_CHANNEL_1
-         adc_raw_ch0 = adc_dma_buf[1];  // Rank 2 → ADC_CHANNEL_0
+         adc_raw_ch1 = adc_dma_buf[0];
+         adc_raw_ch0 = adc_dma_buf[1];
 
          ch1_voltage = (adc_raw_ch1 * VDDA_VOLTAGE) / ADC_MAX_VALUE;
          ch0_voltage = (adc_raw_ch0 * VDDA_VOLTAGE) / ADC_MAX_VALUE;
 
-        // Clear alerts first, then check conditions
         alert_gate = 0;
         alert_hv = 0;
 
@@ -1167,368 +1445,153 @@ void hv_adc_reading(void)
 
 void bi_hi_pwm(uint16_t dataa) {
     switch (dataa) {
-    case 0:
-        TIM3->CCR1 = 0;
-        break;
-    case 1:
-        TIM3->CCR1 = 102;
-        break;
-    case 2:
-        TIM3->CCR1 = 186;
-        break;
-    case 3:
-        TIM3->CCR1 = 246;
-        break;
-    case 4:
-        TIM3->CCR1 = 307;
-        break;
-    case 5:
-        TIM3->CCR1 = 353;
-        break;
-    case 6:
-        TIM3->CCR1 = 384;
-        break;
-    case 7:
-        TIM3->CCR1 = 423;
-        break;
-    case 8:
-        TIM3->CCR1 = 458;
-        break;
-    case 9:
-        TIM3->CCR1 = 496;
-        break;
-    case 10:
-        TIM3->CCR1 = 524;
-        break;
-    case 11:
-        TIM3->CCR1 = 544;
-        break;
-    case 12:
-        TIM3->CCR1 = 583;
-        break;
-    case 13:
-        TIM3->CCR1 = 609;
-        break;
-    case 14:
-        TIM3->CCR1 = 630;
-        break;
-    case 15:
-        TIM3->CCR1 = 655;
-        break;
-    case 16:
-        TIM3->CCR1 = 673;
-        break;
-    case 17:
-        TIM3->CCR1 = 697;
-        break;
-    case 18:
-        TIM3->CCR1 = 717;
-        break;
-    case 19:
-        TIM3->CCR1 = 742;
-        break;
-    case 20:
-        TIM3->CCR1 = 754;
-        break;
-    case 21:
-        TIM3->CCR1 = 781;
-        break;
-    case 22:
-        TIM3->CCR1 = 803;
-        break;
-    case 23:
-        TIM3->CCR1 = 812;
-        break;
-    case 24:
-        TIM3->CCR1 = 836;
-        break;
-    case 25:
-        TIM3->CCR1 = 856;
-        break;
-    case 26:
-        TIM3->CCR1 = 867;
-        break;
-    case 27:
-        TIM3->CCR1 = 889;
-        break;
-    case 28:
-        TIM3->CCR1 = 901;
-        break;
-    case 29:
-        TIM3->CCR1 = 930;
-        break;
-    case 30:
-        TIM3->CCR1 = 948;
-        break;
-    case 31:
-        TIM3->CCR1 = 960;
-        break;
-    case 32:
-        TIM3->CCR1 = 981;
-        break;
-    case 33:
-        TIM3->CCR1 = 989;
-        break;
-    case 34:
-        TIM3->CCR1 = 998;
-        break;
-    case 35:
-        TIM3->CCR1 = 998;
-        break;
-    default:
-        TIM3->CCR1 = 0;
-        break;
+    case 0:  TIM3->CCR1 = 0;    break;
+    case 1:  TIM3->CCR1 = 102;  break;
+    case 2:  TIM3->CCR1 = 186;  break;
+    case 3:  TIM3->CCR1 = 246;  break;
+    case 4:  TIM3->CCR1 = 307;  break;
+    case 5:  TIM3->CCR1 = 353;  break;
+    case 6:  TIM3->CCR1 = 384;  break;
+    case 7:  TIM3->CCR1 = 423;  break;
+    case 8:  TIM3->CCR1 = 458;  break;
+    case 9:  TIM3->CCR1 = 496;  break;
+    case 10: TIM3->CCR1 = 524;  break;
+    case 11: TIM3->CCR1 = 544;  break;
+    case 12: TIM3->CCR1 = 583;  break;
+    case 13: TIM3->CCR1 = 609;  break;
+    case 14: TIM3->CCR1 = 630;  break;
+    case 15: TIM3->CCR1 = 655;  break;
+    case 16: TIM3->CCR1 = 673;  break;
+    case 17: TIM3->CCR1 = 697;  break;
+    case 18: TIM3->CCR1 = 717;  break;
+    case 19: TIM3->CCR1 = 742;  break;
+    case 20: TIM3->CCR1 = 754;  break;
+    case 21: TIM3->CCR1 = 781;  break;
+    case 22: TIM3->CCR1 = 803;  break;
+    case 23: TIM3->CCR1 = 812;  break;
+    case 24: TIM3->CCR1 = 836;  break;
+    case 25: TIM3->CCR1 = 856;  break;
+    case 26: TIM3->CCR1 = 867;  break;
+    case 27: TIM3->CCR1 = 889;  break;
+    case 28: TIM3->CCR1 = 901;  break;
+    case 29: TIM3->CCR1 = 930;  break;
+    case 30: TIM3->CCR1 = 948;  break;
+    case 31: TIM3->CCR1 = 960;  break;
+    case 32: TIM3->CCR1 = 981;  break;
+    case 33: TIM3->CCR1 = 989;  break;
+    case 34: TIM3->CCR1 = 998;  break;
+    case 35: TIM3->CCR1 = 998;  break;
+    default: TIM3->CCR1 = 0;    break;
     }
 }
 
 void lowfunction(uint16_t dataa) {
-    // Limit input to valid range
     if (dataa > 200) dataa = 200;
 
     uint32_t pwm_value = 0;
 
     switch (dataa) {
-        // 0-10 range
-        case 0:  pwm_value = 0;    break;
-        case 1:  pwm_value = 12;   break;
-        case 2:  pwm_value = 42;   break;
-        case 3:  pwm_value = 69;   break;
-        case 4:  pwm_value = 98;   break;
-        case 5:  pwm_value = 114;  break;
-        case 6:  pwm_value = 139;  break;
-        case 7:  pwm_value = 158;  break;
-        case 8:  pwm_value = 171;  break;
-        case 9:  pwm_value = 181;  break;
-        case 10: pwm_value = 196;  break;
-
-        // 11-20 range
-        case 11: pwm_value = 207;  break;
-        case 12: pwm_value = 215;  break;
-        case 13: pwm_value = 226;  break;
-        case 14: pwm_value = 226;  break;
-        case 15: pwm_value = 239;  break;
-        case 16: pwm_value = 249;  break;
-        case 17: pwm_value = 262;  break;
-        case 18: pwm_value = 271;  break;
-        case 19: pwm_value = 271;  break;
-        case 20: pwm_value = 279;  break;
-
-        // 21-30 range
-        case 21: pwm_value = 298;  break;
-        case 22: pwm_value = 298;  break;
-        case 23: pwm_value = 309;  break;
-        case 24: pwm_value = 319;  break;
-        case 25: pwm_value = 319;  break;
-        case 26: pwm_value = 332;  break;
-        case 27: pwm_value = 332;  break;
-        case 28: pwm_value = 341;  break;
-        case 29: pwm_value = 341;  break;
-        case 30: pwm_value = 352;  break;
-
-        // 31-40 range
-        case 31: pwm_value = 363;  break;
-        case 32: pwm_value = 363;  break;
-        case 33: pwm_value = 375;  break;
-        case 34: pwm_value = 375;  break;
-        case 35: pwm_value = 385;  break;
-        case 36: pwm_value = 385;  break;
-        case 37: pwm_value = 396;  break;
-        case 38: pwm_value = 396;  break;
-        case 39: pwm_value = 405;  break;
-        case 40: pwm_value = 408;  break;
-
-        // 41-50 range
-        case 41: pwm_value = 419;  break;
-        case 42: pwm_value = 419;  break;
-        case 43: pwm_value = 428;  break;
-        case 44: pwm_value = 428;  break;
-        case 45: pwm_value = 438;  break;
-        case 46: pwm_value = 438;  break;
-        case 47: pwm_value = 438;  break;
-        case 48: pwm_value = 454;  break;
-        case 49: pwm_value = 454;  break;
-        case 50: pwm_value = 463;  break;
-
-        // 51-60 range
-        case 51: pwm_value = 462;  break;
-        case 52: pwm_value = 475;  break;
-        case 53: pwm_value = 475;  break;
-        case 54: pwm_value = 475;  break;
-        case 55: pwm_value = 482;  break;
-        case 56: pwm_value = 488;  break;
-        case 57: pwm_value = 501;  break;
-        case 58: pwm_value = 501;  break;
-        case 59: pwm_value = 501;  break;
-        case 60: pwm_value = 502;  break;
-
-        // 61-70 range
-        case 61: pwm_value = 512;  break;
-        case 62: pwm_value = 524;  break;
-        case 63: pwm_value = 524;  break;
-        case 64: pwm_value = 524;  break;
-        case 65: pwm_value = 537;  break;
-        case 66: pwm_value = 537;  break;
-        case 67: pwm_value = 547;  break;
-        case 68: pwm_value = 547;  break;
-        case 69: pwm_value = 547;  break;
-        case 70: pwm_value = 557;  break;
-
-        // 71-80 range
-        case 71: pwm_value = 557;  break;
-        case 72: pwm_value = 557;  break;
-        case 73: pwm_value = 568;  break;
-        case 74: pwm_value = 568;  break;
-        case 75: pwm_value = 568;  break;
-        case 76: pwm_value = 577;  break;
-        case 77: pwm_value = 577;  break;
-        case 78: pwm_value = 577;  break;
-        case 79: pwm_value = 589;  break;
-        case 80: pwm_value = 589;  break;
-
-        // 81-90 range
-        case 81: pwm_value = 589;  break;
-        case 82: pwm_value = 598;  break;
-        case 83: pwm_value = 598;  break;
-        case 84: pwm_value = 598;  break;
-        case 85: pwm_value = 611;  break;
-        case 86: pwm_value = 611;  break;
-        case 87: pwm_value = 611;  break;
-        case 88: pwm_value = 621;  break;
-        case 89: pwm_value = 621;  break;
-        case 90: pwm_value = 621;  break;
-
-        // 91-100 range
-        case 91: pwm_value = 633;  break;
-        case 92: pwm_value = 633;  break;
-        case 93: pwm_value = 633;  break;
-        case 94: pwm_value = 647;  break;
-        case 95: pwm_value = 647;  break;
-        case 96: pwm_value = 647;  break;
-        case 97: pwm_value = 658;  break;
-        case 98: pwm_value = 658;  break;
-        case 99: pwm_value = 671;  break;
-        case 100: pwm_value = 671; break;
-
-        // 101-110 range
-        case 101: pwm_value = 682; break;
-        case 102: pwm_value = 686; break;
-        case 103: pwm_value = 690; break;
-        case 104: pwm_value = 694; break;
-        case 105: pwm_value = 698; break;
-        case 106: pwm_value = 700; break;
-        case 107: pwm_value = 701; break;
-        case 108: pwm_value = 702; break;
-        case 109: pwm_value = 702; break;
-        case 110: pwm_value = 702; break;
-
-        // 111-120 range
-        case 111: pwm_value = 705; break;
-        case 112: pwm_value = 708; break;
-        case 113: pwm_value = 710; break;
-        case 114: pwm_value = 713; break;
-        case 115: pwm_value = 716; break;
-        case 116: pwm_value = 718; break;
-        case 117: pwm_value = 721; break;
-        case 118: pwm_value = 723; break;
-        case 119: pwm_value = 724; break;
-        case 120: pwm_value = 725; break;
-
-        // 121-130 range
-        case 121: pwm_value = 730; break;
-        case 122: pwm_value = 735; break;
-        case 123: pwm_value = 740; break;
-        case 124: pwm_value = 745; break;
-        case 125: pwm_value = 748; break;
-        case 126: pwm_value = 750; break;
-        case 127: pwm_value = 753; break;
-        case 128: pwm_value = 755; break;
-        case 129: pwm_value = 756; break;
-        case 130: pwm_value = 757; break;
-
-        // 131-140 range
-        case 131: pwm_value = 762; break;
-        case 132: pwm_value = 767; break;
-        case 133: pwm_value = 772; break;
-        case 134: pwm_value = 777; break;
-        case 135: pwm_value = 782; break;
-        case 136: pwm_value = 785; break;
-        case 137: pwm_value = 787; break;
-        case 138: pwm_value = 789; break;
-        case 139: pwm_value = 790; break;
-        case 140: pwm_value = 790; break;
-
-        // 141-150 range
-        case 141: pwm_value = 795; break;
-        case 142: pwm_value = 798; break;
-        case 143: pwm_value = 801; break;
-        case 144: pwm_value = 804; break;
-        case 145: pwm_value = 807; break;
-        case 146: pwm_value = 809; break;
-        case 147: pwm_value = 811; break;
-        case 148: pwm_value = 812; break;
-        case 149: pwm_value = 813; break;
-        case 150: pwm_value = 813; break;
-
-        // 151-160 range
-        case 151: pwm_value = 818; break;
-        case 152: pwm_value = 823; break;
-        case 153: pwm_value = 828; break;
-        case 154: pwm_value = 833; break;
-        case 155: pwm_value = 838; break;
-        case 156: pwm_value = 841; break;
-        case 157: pwm_value = 844; break;
-        case 158: pwm_value = 845; break;
-        case 159: pwm_value = 846; break;
-        case 160: pwm_value = 847; break;
-
-        // 161-170 range
-        case 161: pwm_value = 852; break;
-        case 162: pwm_value = 856; break;
-        case 163: pwm_value = 860; break;
-        case 164: pwm_value = 863; break;
-        case 165: pwm_value = 866; break;
-        case 166: pwm_value = 868; break;
-        case 167: pwm_value = 869; break;
-        case 168: pwm_value = 869; break;
-        case 169: pwm_value = 869; break;
-        case 170: pwm_value = 869; break;
-
-        // 171-180 range
-        case 171: pwm_value = 874; break;
-        case 172: pwm_value = 879; break;
-        case 173: pwm_value = 884; break;
-        case 174: pwm_value = 887; break;
-        case 175: pwm_value = 890; break;
-        case 176: pwm_value = 892; break;
-        case 177: pwm_value = 893; break;
-        case 178: pwm_value = 894; break;
-        case 179: pwm_value = 895; break;
-        case 180: pwm_value = 895; break;
-
-        // 181-190 range
-        case 181: pwm_value = 900; break;
-        case 182: pwm_value = 905; break;
-        case 183: pwm_value = 910; break;
-        case 184: pwm_value = 915; break;
-        case 185: pwm_value = 918; break;
-        case 186: pwm_value = 920; break;
-        case 187: pwm_value = 923; break;
-        case 188: pwm_value = 926; break;
-        case 189: pwm_value = 928; break;
-        case 190: pwm_value = 930; break;
-
-        // 191-200 range
-        case 191: pwm_value = 934; break;
-        case 192: pwm_value = 938; break;
-        case 193: pwm_value = 941; break;
-        case 194: pwm_value = 944; break;
-        case 195: pwm_value = 947; break;
-        case 196: pwm_value = 949; break;
-        case 197: pwm_value = 950; break;
-        case 198: pwm_value = 951; break;
-        case 199: pwm_value = 952; break;
+        case 0:   pwm_value = 0;    break;   case 1:   pwm_value = 12;   break;
+        case 2:   pwm_value = 42;   break;   case 3:   pwm_value = 69;   break;
+        case 4:   pwm_value = 98;   break;   case 5:   pwm_value = 114;  break;
+        case 6:   pwm_value = 139;  break;   case 7:   pwm_value = 158;  break;
+        case 8:   pwm_value = 171;  break;   case 9:   pwm_value = 181;  break;
+        case 10:  pwm_value = 196;  break;   case 11:  pwm_value = 207;  break;
+        case 12:  pwm_value = 215;  break;   case 13:  pwm_value = 226;  break;
+        case 14:  pwm_value = 226;  break;   case 15:  pwm_value = 239;  break;
+        case 16:  pwm_value = 249;  break;   case 17:  pwm_value = 262;  break;
+        case 18:  pwm_value = 271;  break;   case 19:  pwm_value = 271;  break;
+        case 20:  pwm_value = 279;  break;   case 21:  pwm_value = 298;  break;
+        case 22:  pwm_value = 298;  break;   case 23:  pwm_value = 309;  break;
+        case 24:  pwm_value = 319;  break;   case 25:  pwm_value = 319;  break;
+        case 26:  pwm_value = 332;  break;   case 27:  pwm_value = 332;  break;
+        case 28:  pwm_value = 341;  break;   case 29:  pwm_value = 341;  break;
+        case 30:  pwm_value = 352;  break;   case 31:  pwm_value = 363;  break;
+        case 32:  pwm_value = 363;  break;   case 33:  pwm_value = 375;  break;
+        case 34:  pwm_value = 375;  break;   case 35:  pwm_value = 385;  break;
+        case 36:  pwm_value = 385;  break;   case 37:  pwm_value = 396;  break;
+        case 38:  pwm_value = 396;  break;   case 39:  pwm_value = 405;  break;
+        case 40:  pwm_value = 408;  break;   case 41:  pwm_value = 419;  break;
+        case 42:  pwm_value = 419;  break;   case 43:  pwm_value = 428;  break;
+        case 44:  pwm_value = 428;  break;   case 45:  pwm_value = 438;  break;
+        case 46:  pwm_value = 438;  break;   case 47:  pwm_value = 438;  break;
+        case 48:  pwm_value = 454;  break;   case 49:  pwm_value = 454;  break;
+        case 50:  pwm_value = 463;  break;   case 51:  pwm_value = 462;  break;
+        case 52:  pwm_value = 475;  break;   case 53:  pwm_value = 475;  break;
+        case 54:  pwm_value = 475;  break;   case 55:  pwm_value = 482;  break;
+        case 56:  pwm_value = 488;  break;   case 57:  pwm_value = 501;  break;
+        case 58:  pwm_value = 501;  break;   case 59:  pwm_value = 501;  break;
+        case 60:  pwm_value = 502;  break;   case 61:  pwm_value = 512;  break;
+        case 62:  pwm_value = 524;  break;   case 63:  pwm_value = 524;  break;
+        case 64:  pwm_value = 524;  break;   case 65:  pwm_value = 537;  break;
+        case 66:  pwm_value = 537;  break;   case 67:  pwm_value = 547;  break;
+        case 68:  pwm_value = 547;  break;   case 69:  pwm_value = 547;  break;
+        case 70:  pwm_value = 557;  break;   case 71:  pwm_value = 557;  break;
+        case 72:  pwm_value = 557;  break;   case 73:  pwm_value = 568;  break;
+        case 74:  pwm_value = 568;  break;   case 75:  pwm_value = 568;  break;
+        case 76:  pwm_value = 577;  break;   case 77:  pwm_value = 577;  break;
+        case 78:  pwm_value = 577;  break;   case 79:  pwm_value = 589;  break;
+        case 80:  pwm_value = 589;  break;   case 81:  pwm_value = 589;  break;
+        case 82:  pwm_value = 598;  break;   case 83:  pwm_value = 598;  break;
+        case 84:  pwm_value = 598;  break;   case 85:  pwm_value = 611;  break;
+        case 86:  pwm_value = 611;  break;   case 87:  pwm_value = 611;  break;
+        case 88:  pwm_value = 621;  break;   case 89:  pwm_value = 621;  break;
+        case 90:  pwm_value = 621;  break;   case 91:  pwm_value = 633;  break;
+        case 92:  pwm_value = 633;  break;   case 93:  pwm_value = 633;  break;
+        case 94:  pwm_value = 647;  break;   case 95:  pwm_value = 647;  break;
+        case 96:  pwm_value = 647;  break;   case 97:  pwm_value = 658;  break;
+        case 98:  pwm_value = 658;  break;   case 99:  pwm_value = 671;  break;
+        case 100: pwm_value = 671; break;    case 101: pwm_value = 682; break;
+        case 102: pwm_value = 686; break;    case 103: pwm_value = 690; break;
+        case 104: pwm_value = 694; break;    case 105: pwm_value = 698; break;
+        case 106: pwm_value = 700; break;    case 107: pwm_value = 701; break;
+        case 108: pwm_value = 702; break;    case 109: pwm_value = 702; break;
+        case 110: pwm_value = 702; break;    case 111: pwm_value = 705; break;
+        case 112: pwm_value = 708; break;    case 113: pwm_value = 710; break;
+        case 114: pwm_value = 713; break;    case 115: pwm_value = 716; break;
+        case 116: pwm_value = 718; break;    case 117: pwm_value = 721; break;
+        case 118: pwm_value = 723; break;    case 119: pwm_value = 724; break;
+        case 120: pwm_value = 725; break;    case 121: pwm_value = 730; break;
+        case 122: pwm_value = 735; break;    case 123: pwm_value = 740; break;
+        case 124: pwm_value = 745; break;    case 125: pwm_value = 748; break;
+        case 126: pwm_value = 750; break;    case 127: pwm_value = 753; break;
+        case 128: pwm_value = 755; break;    case 129: pwm_value = 756; break;
+        case 130: pwm_value = 757; break;    case 131: pwm_value = 762; break;
+        case 132: pwm_value = 767; break;    case 133: pwm_value = 772; break;
+        case 134: pwm_value = 777; break;    case 135: pwm_value = 782; break;
+        case 136: pwm_value = 785; break;    case 137: pwm_value = 787; break;
+        case 138: pwm_value = 789; break;    case 139: pwm_value = 790; break;
+        case 140: pwm_value = 790; break;    case 141: pwm_value = 795; break;
+        case 142: pwm_value = 798; break;    case 143: pwm_value = 801; break;
+        case 144: pwm_value = 804; break;    case 145: pwm_value = 807; break;
+        case 146: pwm_value = 809; break;    case 147: pwm_value = 811; break;
+        case 148: pwm_value = 812; break;    case 149: pwm_value = 813; break;
+        case 150: pwm_value = 813; break;    case 151: pwm_value = 818; break;
+        case 152: pwm_value = 823; break;    case 153: pwm_value = 828; break;
+        case 154: pwm_value = 833; break;    case 155: pwm_value = 838; break;
+        case 156: pwm_value = 841; break;    case 157: pwm_value = 844; break;
+        case 158: pwm_value = 845; break;    case 159: pwm_value = 846; break;
+        case 160: pwm_value = 847; break;    case 161: pwm_value = 852; break;
+        case 162: pwm_value = 856; break;    case 163: pwm_value = 860; break;
+        case 164: pwm_value = 863; break;    case 165: pwm_value = 866; break;
+        case 166: pwm_value = 868; break;    case 167: pwm_value = 869; break;
+        case 168: pwm_value = 869; break;    case 169: pwm_value = 869; break;
+        case 170: pwm_value = 869; break;    case 171: pwm_value = 874; break;
+        case 172: pwm_value = 879; break;    case 173: pwm_value = 884; break;
+        case 174: pwm_value = 887; break;    case 175: pwm_value = 890; break;
+        case 176: pwm_value = 892; break;    case 177: pwm_value = 893; break;
+        case 178: pwm_value = 894; break;    case 179: pwm_value = 895; break;
+        case 180: pwm_value = 895; break;    case 181: pwm_value = 900; break;
+        case 182: pwm_value = 905; break;    case 183: pwm_value = 910; break;
+        case 184: pwm_value = 915; break;    case 185: pwm_value = 918; break;
+        case 186: pwm_value = 920; break;    case 187: pwm_value = 923; break;
+        case 188: pwm_value = 926; break;    case 189: pwm_value = 928; break;
+        case 190: pwm_value = 930; break;    case 191: pwm_value = 934; break;
+        case 192: pwm_value = 938; break;    case 193: pwm_value = 941; break;
+        case 194: pwm_value = 944; break;    case 195: pwm_value = 947; break;
+        case 196: pwm_value = 949; break;    case 197: pwm_value = 950; break;
+        case 198: pwm_value = 951; break;    case 199: pwm_value = 952; break;
         case 200: pwm_value = 952; break;
-
         default: pwm_value = 0; break;
     }
 
@@ -1543,7 +1606,6 @@ void lowfunction(uint16_t dataa) {
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-    /* User can add his own implementation to report the HAL error return state */
     __disable_irq();
     while (1) {
     }
@@ -1561,8 +1623,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
