@@ -59,6 +59,9 @@
 #define VAR_ICON_KEY_MAX     78      // 3 return keys select icons 76, 77, 78
 #define MODE_KEY_HIGH        0x004F  // VP 0x2000 return key — high mode (page 1)
 #define MODE_KEY_BIPOLAR     0x004D  // VP 0x2000 return key — bipolar mode (page 1)
+#define DEFAULT_BRIGHTNESS   100     // Boot default if EEPROM empty (0-100)
+#define MIN_BRIGHTNESS       30      // VP 0x0082 minimum — never go below this
+#define VP_BRIGHTNESS        0x0082  // DWIN backlight variable
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -104,6 +107,11 @@ uint16_t previous_low = 0;
 volatile uint8_t dwin_pkt_ready = 0;
 static uint32_t low_save_enable_tick = 0;
 static uint32_t low_display_push_until = 0;
+static uint32_t brightness_display_push_until = 0;
+static uint32_t brightness_save_enable_tick = 0;
+static uint8_t brightness_user_touched = 0;
+static uint8_t low_user_touched = 0;
+static uint32_t low_last_accept_tick = 0;
 static uint32_t vp3003_save_enable_tick = 0;
 static uint32_t vp3003_page1_restore_until = 0;
 static uint8_t vp3003_user_touched = 0;
@@ -162,6 +170,9 @@ void send_var_icon_to_display(void);
 void dwin_apply_boot_var_icon(void);
 void eeprom_read_low_value(void);
 void eeprom_save_low_value(void);
+void eeprom_read_brightness(void);
+void dwin_send_brightness(void);
+void dwin_refresh_brightness(void);
 void low_sync_both_vps(void);
 void low_push_display_from_eeprom(void);
 void eeprom_read_vp3003_value(void);
@@ -240,10 +251,99 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
         }
     } else if (*addr == VP_VAR_ICON) {
         max_val = MODE_KEY_HIGH;
+    } else if (*addr == VP_BRIGHTNESS) {
+        max_val = 100;
     }
 
     uint8_t cmd = RxData[3];
     uint8_t len = RxData[2];
+
+    if (*addr == VP_BRIGHTNESS && cmd == 0x83) {
+        if (len >= 6) {
+            uint16_t v = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[8]);
+            if (v <= 100U) {
+                *data = v;
+                *valid = 1;
+            } else if (RxData[7] <= 100U) {
+                *data = RxData[7];
+                *valid = 1;
+            } else if (RxData[8] <= 100U) {
+                *data = RxData[8];
+                *valid = 1;
+            }
+            return;
+        }
+        if (len >= 4) {
+            uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+            if (be <= 100U) {
+                *data = be;
+                *valid = 1;
+            } else if (le <= 100U) {
+                *data = le;
+                *valid = 1;
+            } else if (RxData[7] <= 100U) {
+                *data = RxData[7];
+                *valid = 1;
+            }
+            return;
+        }
+    }
+
+    /* DWIN brightness write is often 5A A5 04 82 00 82 VV (len=4, one data byte) */
+    if (*addr == VP_BRIGHTNESS && cmd == 0x82) {
+        if (len >= 4 && RxData[6] <= 100U) {
+            *data = RxData[6];
+            *valid = 1;
+            return;
+        }
+        if (len >= 5) {
+            uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+            if (be <= 100U) {
+                *data = be;
+                *valid = 1;
+            } else if (le <= 100U) {
+                *data = le;
+                *valid = 1;
+            }
+            return;
+        }
+    }
+
+    /* VP 0x1000 / 0x3002 — DWIN 0x83 auto-upload uses bytes 7-8, not 6-7 */
+    if ((*addr == VP_LOW_VALUE || *addr == VP_LOW_DATA) && cmd == 0x83) {
+        if (len >= 6) {
+            *data = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[8]);
+            *valid = 1;
+            return;
+        }
+        if (len >= 4) {
+            uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+            if (be <= LOW_VALUE_MAX) {
+                *data = be;
+                *valid = 1;
+            } else if (le <= LOW_VALUE_MAX) {
+                *data = le;
+                *valid = 1;
+            }
+            return;
+        }
+    }
+
+    if ((*addr == VP_LOW_VALUE || *addr == VP_LOW_DATA) && cmd == 0x82 && len >= 5) {
+        uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+        uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+        if (be <= LOW_VALUE_MAX) {
+            *data = be;
+            *valid = 1;
+        } else if (le <= LOW_VALUE_MAX) {
+            *data = le;
+            *valid = 1;
+        }
+        return;
+    }
 
     if (cmd == 0x82 && len >= 5) {
         uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
@@ -282,16 +382,18 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
 }
 
 void low_value_user_changed(uint16_t new_low) {
-    if (HAL_GetTick() < low_save_enable_tick) {
-        return;
-    }
     if (new_low > LOW_VALUE_MAX) {
         new_low = LOW_VALUE_MAX;
     }
 
-    /* DWIN 22.bin floods VP 0x1000 with max (200) on page load — never save that */
+    /* DWIN VP 0x2002 icon=low/2 snaps even values back (20→19, 200→199) */
+    if (new_low == low - 1 && (low & 1U) == 0U && low > 0U &&
+        (HAL_GetTick() - low_last_accept_tick) < 500U) {
+        return;
+    }
+
+    /* 22.bin floods 200/110 on page load — never save, never UART echo */
     if ((new_low == LOW_VALUE_MAX || new_low == 110) && low < (LOW_VALUE_MAX - 3)) {
-        low_sync_both_vps();
         return;
     }
 
@@ -303,18 +405,20 @@ void low_value_user_changed(uint16_t new_low) {
     loww[0] = (uint8_t)((low >> 8) & 0xFF);
     loww[1] = (uint8_t)(low & 0xFF);
     eeprom_save_low_value();
-    previous_low = low;
-
-    low_sync_both_vps();
-
-    icon_id = low / 2;
-    icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
-    icon_array[1] = (uint8_t)(icon_id & 0xFF);
-    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+    low_user_touched = 1;
+    low_display_push_until = 0;
+    low_last_accept_tick = HAL_GetTick();
 
     if (mode == 0x4e && ((footswitch) || (active))) {
         lowfunction(low);
     }
+}
+
+static void low_handle_rx(uint16_t new_low) {
+    if (HAL_GetTick() < low_save_enable_tick) {
+        return;
+    }
+    low_value_user_changed(new_low);
 }
 
 static void dwin_uart_send(const uint8_t *data, uint16_t len) {
@@ -341,6 +445,7 @@ void dwin_boot_to_page(uint8_t page_num) {
         send_page_change(page_num);
         HAL_Delay(100);
     }
+    HAL_Delay(500);
 }
 
 void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low) {
@@ -349,7 +454,7 @@ void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, 
         addr_high, addr_low, data_high, data_low
     };
     dwin_uart_send(cmd, 8);
-    HAL_Delay(20);
+    HAL_Delay(10);
 }
 
 void dwin_set_var_icon(uint16_t icon_id) {
@@ -408,6 +513,143 @@ void eeprom_save_low_value(void) {
     } else {
         eeprom_err = true;
     }
+}
+
+static uint8_t i2c_eeprom_read16(uint16_t addr, uint8_t *buf) {
+    buf[0] = 0xFF;
+    buf[1] = 0xFF;
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 2, 20) != HAL_OK) {
+        return 0;
+    }
+    if (HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, addr, I2C_MEMADD_SIZE_16BIT, buf, 2, 200) != HAL_OK) {
+        return 0;
+    }
+    HAL_Delay(5);
+    return 1;
+}
+
+static void eeprom_apply_brightness(uint16_t val) {
+    if (val == 0 || val == 0xFFFF || val > 100) {
+        val = DEFAULT_BRIGHTNESS;
+    } else if (val < MIN_BRIGHTNESS) {
+        val = MIN_BRIGHTNESS;
+    }
+    brightnes = val;
+    brightness[0] = 0x00;
+    brightness[1] = (uint8_t)val;
+}
+
+static void eeprom_save_brightness(void) {
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0100, I2C_MEMADD_SIZE_16BIT,
+                          brightness, 2, 1000);
+        HAL_Delay(10);
+    }
+}
+
+void eeprom_read_brightness(void) {
+    eeprom_apply_brightness(DEFAULT_BRIGHTNESS);
+
+    if (!i2c_eeprom_read16(0x0100, brightness)) {
+        eeprom_save_brightness();
+        return;
+    }
+
+    uint16_t val = (uint16_t)((brightness[0] << 8) | brightness[1]);
+    if (val == 0xFFFF || (brightness[0] == 0xFF && brightness[1] == 0xFF)) {
+        eeprom_save_brightness();
+        return;
+    }
+
+    uint16_t before = val;
+    eeprom_apply_brightness(val);
+    if (brightnes != before) {
+        eeprom_save_brightness();
+    }
+}
+
+static void dwin_send_brightness_quick(void) {
+    uint8_t v = (uint8_t)brightnes;
+    if (v < MIN_BRIGHTNESS) {
+        v = MIN_BRIGHTNESS;
+    }
+    uint8_t cmd[7] = {0x5A, 0xA5, 0x04, 0x82, 0x00, 0x82, v};
+    dwin_uart_send(cmd, 7);
+}
+
+void dwin_send_brightness(void) {
+    uint8_t v = (uint8_t)brightnes;
+    if (v < MIN_BRIGHTNESS) {
+        v = MIN_BRIGHTNESS;
+        brightnes = v;
+        brightness[1] = v;
+    }
+
+    /* DWIN spec: 5A A5 04 82 00 82 VV — value in one byte, not 00 VV */
+    dwin_send_brightness_quick();
+    HAL_Delay(20);
+
+    /* Alternate: duplicate data bytes VV VV */
+    uint8_t cmd_dup[8] = {0x5A, 0xA5, 0x05, 0x82, 0x00, 0x82, v, v};
+    dwin_uart_send(cmd_dup, 8);
+}
+
+static void dwin_disable_backlight_standby(void) {
+    /* VP 0x0080: bit2=0 standby off, bit3=1 touch buzzer ON (0x30 mutes buzzer) */
+    uint8_t cmd[10] = {0x5A, 0xA5, 0x07, 0x82, 0x00, 0x80, 0x5A, 0x00, 0x00, 0x38};
+    dwin_uart_send(cmd, 10);
+    HAL_Delay(25);
+}
+
+static void brightness_user_changed(uint16_t requested) {
+    if (requested > 100U) {
+        return;
+    }
+
+    uint16_t before = brightnes;
+    eeprom_apply_brightness(requested);
+    if (brightnes == before) {
+        return;
+    }
+
+    eeprom_save_brightness();
+    brightness_user_touched = 1;
+    brightness_display_push_until = 0;
+
+    if (requested < MIN_BRIGHTNESS) {
+        dwin_send_brightness_quick();
+    }
+}
+
+static void brightness_handle_rx(uint16_t reported) {
+    if (HAL_GetTick() < brightness_save_enable_tick) {
+        return;
+    }
+    brightness_user_changed(reported);
+}
+
+static void dwin_poll_brightness(void) {
+    static uint32_t last_poll = 0;
+
+    if (HAL_GetTick() < brightness_save_enable_tick) {
+        return;
+    }
+    if (HAL_GetTick() - last_poll < 800U) {
+        return;
+    }
+    last_poll = HAL_GetTick();
+
+    uint8_t cmd[7] = {0x5A, 0xA5, 0x04, 0x83, 0x00, 0x82, 0x01};
+    dwin_uart_send(cmd, 7);
+}
+
+void dwin_refresh_brightness(void) {
+    eeprom_read_brightness();
+    brightness_user_touched = 0;
+    brightness_display_push_until = HAL_GetTick() + 8000;
+    brightness_save_enable_tick = HAL_GetTick() + 500;
+    dwin_disable_backlight_standby();
+    dwin_send_brightness();
 }
 
 void eeprom_read_vp3003_value(void) {
@@ -595,18 +837,11 @@ void low_sync_both_vps(void) {
                        (uint8_t)(VP_LOW_VALUE & 0xFF), dh, dl);
     send_variable_data((uint8_t)((VP_LOW_DATA >> 8) & 0xFF),
                        (uint8_t)(VP_LOW_DATA & 0xFF), dh, dl);
-    HAL_Delay(30);
-    send_variable_data((uint8_t)((VP_LOW_VALUE >> 8) & 0xFF),
-                       (uint8_t)(VP_LOW_VALUE & 0xFF), dh, dl);
 }
 
 void low_push_display_from_eeprom(void) {
     eeprom_read_low_value();
     low_sync_both_vps();
-    icon_id = low / 2;
-    icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
-    icon_array[1] = (uint8_t)(icon_id & 0xFF);
-    send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
     previous_low = low;
 }
 
@@ -615,10 +850,15 @@ void low_send_to_display(void) {
 }
 
 void dwin_refresh_page2_values(void) {
+    low_user_touched = 0;
     low_push_display_from_eeprom();
     send_var_icon_to_display();
-    low_save_enable_tick = HAL_GetTick() + 1000;
-    low_display_push_until = HAL_GetTick() + 2500;
+    low_save_enable_tick = HAL_GetTick() + 5000;
+    low_display_push_until = HAL_GetTick() + 10000;
+    HAL_Delay(150);
+    low_sync_both_vps();
+    HAL_Delay(150);
+    low_sync_both_vps();
 }
 
 void dwin_refresh_page1_values(void) {
@@ -635,11 +875,12 @@ void dwin_open_page1(void) {
     dwin_refresh_page1_values();
     HAL_Delay(400);
     vp3003_send_to_display();
+    dwin_refresh_brightness();
 }
 
 void dwin_open_page2(void) {
     send_page_change(0x02);
-    HAL_Delay(400);
+    HAL_Delay(500);
     dwin_refresh_page2_values();
 }
 
@@ -701,47 +942,27 @@ int main(void)
   /* Read EEPROM before any display UART (so we know the real low value) */
   eeprom_read_low_value();
 
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0200, I2C_MEMADD_SIZE_16BIT,
-          current_page_array, 2, 1000);
-  HAL_Delay(10);
+  i2c_eeprom_read16(0x0200, current_page_array);
   current_page = (current_page_array[0] << 8) | current_page_array[1];
   if (current_page != 2) {
       current_page = 2;
   }
 
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x000A, I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
-  HAL_Delay(10);
+  i2c_eeprom_read16(0x000A, modee);
   mode = (modee[0] << 8) | modee[1];
 
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0014, I2C_MEMADD_SIZE_16BIT, highh, 2, 1000);
-  HAL_Delay(10);
+  i2c_eeprom_read16(0x0014, highh);
   high = (highh[0] << 8) | highh[1];
 
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0018, I2C_MEMADD_SIZE_16BIT, bipolarr, 2, 1000);
-  HAL_Delay(10);
+  i2c_eeprom_read16(0x0018, bipolarr);
   bipolar = (bipolarr[0] << 8) | bipolarr[1];
 
   eeprom_read_vp3003_value();
+  eeprom_read_brightness();
 
-  HAL_I2C_Mem_Read(&hi2c1, 0x50 << 1, 0x0100, I2C_MEMADD_SIZE_16BIT,
-          brightness, 2, 1000);
-  HAL_Delay(10);
-  brightnes = (brightness[0] << 8) | brightness[1];
-
-  /* Page 2 splash, then push EEPROM low to VP 0x1000 BEFORE UART RX */
+  /* Page 2 splash — VP restore happens only after DWIN finishes loading */
   dwin_boot_to_page(0x02);
-  HAL_Delay(400);
-
-  dwin_set_var_icon(BOOT_VAR_ICON_VALUE);
-  send_var_icon_to_display();
-  low_sync_both_vps();
-  HAL_Delay(100);
-  low_sync_both_vps();
-
-  icon_id = low / 2;
-  icon_array[0] = (uint8_t)((icon_id >> 8) & 0xFF);
-  icon_array[1] = (uint8_t)(icon_id & 0xFF);
-  send_variable_data(0x20, 0x02, icon_array[0], icon_array[1]);
+  HAL_Delay(500);
 
   dwin_uart_rx_start();
 
@@ -753,11 +974,11 @@ int main(void)
 
   send_variable_data(0x30, 0x00, modee[0], modee[1]);
 
-  send_variable_data(0x00, 0x82, brightness[0], brightness[1]);
-
   current_page = 2;
 
   dwin_apply_boot_var_icon();
+  dwin_refresh_brightness();
+  HAL_Delay(400);
   dwin_refresh_page2_values();
   /* USER CODE END 2 */
 
@@ -786,11 +1007,18 @@ int main(void)
         }
     }
 
-    if (HAL_GetTick() < low_display_push_until) {
+    if (!low_user_touched && HAL_GetTick() < low_display_push_until) {
         static uint32_t last_low_push = 0;
-        if (HAL_GetTick() - last_low_push >= 300) {
+        if (HAL_GetTick() - last_low_push >= 600) {
             low_sync_both_vps();
             last_low_push = HAL_GetTick();
+        }
+    } else if (!brightness_user_touched &&
+               HAL_GetTick() < brightness_display_push_until) {
+        static uint32_t last_brightness_push = 0;
+        if (HAL_GetTick() - last_brightness_push >= 800) {
+            dwin_send_brightness_quick();
+            last_brightness_push = HAL_GetTick();
         }
     }
 
@@ -807,6 +1035,8 @@ int main(void)
 
     save_reading();
     send_loadings();
+
+    dwin_poll_brightness();
 
     debouncing();
     hv_adc_reading();
@@ -1347,7 +1577,7 @@ void save_reading(void) {
 
         // VP 0x1000 or VP 0x3002 — save EEPROM and sync both VPs
         if (address == VP_LOW_VALUE || address == VP_LOW_DATA) {
-            low_value_user_changed(dataa);
+            low_handle_rx(dataa);
             return;
         }
 
@@ -1357,22 +1587,14 @@ void save_reading(void) {
             return;
         }
 
+        // VP 0x0082 backlight — save EEPROM, enforce minimum 80
+        if (address == VP_BRIGHTNESS || address == 0x82) {
+            brightness_handle_rx(dataa);
+            return;
+        }
+
         // Handle other addresses
         switch (address) {
-        case 0x82:
-            test++;
-            brightnes = dataa;
-            brightness[0] = (uint8_t)((dataa >> 8) & 0xFF);
-            brightness[1] = (uint8_t)(dataa & 0xFF);
-            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0100,
-                I2C_MEMADD_SIZE_16BIT, brightness, 2, 1000);
-                HAL_Delay(10);
-            } else {
-                eeprom_err = true;
-            }
-            break;
-
         case 0x2001:
             if (dataa == 0x01) {
                 if ((mode == 0x4f) || (mode == 0x4d)) {
