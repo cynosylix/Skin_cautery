@@ -53,12 +53,22 @@
 #define VP_MODE_DATA         0x3003  // DWIN variable address (high/bipolar/low page value)
 #define EEPROM_ADDR_LOW      0x002A  // EEPROM storage for VP 0x1000 low value
 #define EEPROM_ADDR_VP3003   0x002C  // EEPROM storage for VP 0x3003
+#define EEPROM_ADDR_PAGE     0x002E  // EEPROM storage for last DWIN page (1 or 2)
+#define EEPROM_PAGE_MAGIC    0xA5    // Valid page record marker byte
+#define EEPROM_ADDR_PAGE_OLD 0x0200  // Legacy page address (migration read)
+#define EEPROM_ADDR_VAR_ICON 0x0030  // EEPROM storage for VP 0x2000 var icon
+#define EEPROM_ADDR_VAR_ICON_OLD 0x0300  // Legacy icon address (migration read)
+#define EEPROM_ICON_MAGIC    0xA5    // Valid icon record marker byte
 #define LOW_VALUE_MAX        200     // Maximum low value (INPUT_MAX_LOW)
-#define BOOT_VAR_ICON_VALUE  76      // Icon ID sent to VP 0x2000 after page 2 loads
-#define MIN_VAR_ICON_VALUE   76      // Minimum allowed variable icon value
-#define VAR_ICON_KEY_MAX     78      // 3 return keys select icons 76, 77, 78
-#define MODE_KEY_HIGH        0x004F  // VP 0x2000 return key — high mode (page 1)
-#define MODE_KEY_BIPOLAR     0x004D  // VP 0x2000 return key — bipolar mode (page 1)
+#define BOOT_VAR_ICON_VALUE  78      // Default icon (low mode)
+#define MIN_VAR_ICON_VALUE   77      // Bipolar icon
+#define VAR_ICON_KEY_MAX     79      // High icon
+#define ICON_BIPOLAR         77      // Return key 0x004D
+#define ICON_LOW             78      // Return key 0x004E
+#define ICON_HIGH            79      // Return key 0x004F
+#define MODE_KEY_HIGH        0x004F  // VP 0x2000 return key — high mode
+#define MODE_KEY_LOW         0x004E  // VP 0x2000 return key — low mode
+#define MODE_KEY_BIPOLAR     0x004D  // VP 0x2000 return key — bipolar mode
 #define DEFAULT_BRIGHTNESS   100     // Boot default if EEPROM empty (0-100)
 #define MIN_BRIGHTNESS       30      // VP 0x0082 minimum — never go below this
 #define VP_BRIGHTNESS        0x0082  // DWIN backlight variable
@@ -107,6 +117,10 @@ uint16_t previous_low = 0;
 volatile uint8_t dwin_pkt_ready = 0;
 static uint32_t low_save_enable_tick = 0;
 static uint32_t low_display_push_until = 0;
+static uint32_t var_icon_display_push_until = 0;
+static uint32_t var_icon_boot_push_until = 0;
+static uint32_t var_icon_aggressive_until = 0;
+static uint32_t var_icon_save_enable_tick = 0;
 static uint32_t brightness_display_push_until = 0;
 static uint32_t brightness_save_enable_tick = 0;
 static uint8_t brightness_user_touched = 0;
@@ -115,6 +129,9 @@ static uint32_t low_last_accept_tick = 0;
 static uint32_t vp3003_save_enable_tick = 0;
 static uint32_t vp3003_page1_restore_until = 0;
 static uint8_t vp3003_user_touched = 0;
+static uint8_t saved_settings_page = 0;
+static uint8_t var_icon_user_locked = 0;
+static uint32_t boot_page_guard_until = 0;
 uint32_t delta = 0;
 float frequency = 0.0;
 volatile uint8_t footswitch = 0;
@@ -138,7 +155,7 @@ float ch0_voltage=1.6f;
 
 // Variable icon storage (VP 0x2000)
 uint16_t var_icon_value = BOOT_VAR_ICON_VALUE;
-uint8_t var_icon_data[2] = {0x00, 0x4C};  // 76 = 0x004C
+uint8_t var_icon_data[2] = {0x00, 0x4E};  // 78 = 0x004E low icon
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -177,6 +194,21 @@ void low_sync_both_vps(void);
 void low_push_display_from_eeprom(void);
 void eeprom_read_vp3003_value(void);
 void eeprom_save_vp3003_value(void);
+void eeprom_read_var_icon(void);
+void eeprom_save_var_icon(void);
+void eeprom_save_current_page(uint8_t page_num);
+static void dwin_restore_page_from_eeprom(uint8_t page_num);
+static void dwin_show_settings_page(uint8_t page_num);
+static void dwin_arm_page2_restore_timers(void);
+static void dwin_arm_var_icon_timers(void);
+static void dwin_restore_var_icon_from_eeprom(uint8_t burst_count);
+static void dwin_push_icon_from_eeprom(void);
+static void dwin_icon_burst_from_eeprom(uint8_t count);
+static uint8_t var_icon_from_mode_key(uint16_t key);
+static uint8_t var_icon_from_mode(uint16_t m);
+static void var_icon_apply_return_key(uint16_t key);
+static uint8_t dwin_get_boot_page(void);
+void dwin_restore_saved_state(uint8_t page_num);
 void vp3003_send_to_display(void);
 void vp3003_user_changed(uint16_t new_val);
 void dwin_refresh_page2_values(void);
@@ -187,6 +219,10 @@ void dwin_open_page1(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t i2c_eeprom_read16(uint16_t addr, uint8_t *buf);
+static void send_var_icon_fast(void);
+static void dwin_icon_burst_fast(uint8_t count);
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART3) {
 		if (rxIndex < sizeof(rxData)) {
@@ -250,7 +286,7 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
             max_val = INPUT_MAX_HIBI;
         }
     } else if (*addr == VP_VAR_ICON) {
-        max_val = MODE_KEY_HIGH;
+        max_val = VAR_ICON_KEY_MAX;
     } else if (*addr == VP_BRIGHTNESS) {
         max_val = 100;
     }
@@ -415,6 +451,9 @@ void low_value_user_changed(uint16_t new_low) {
 }
 
 static void low_handle_rx(uint16_t new_low) {
+    if (current_page != 2U) {
+        return;
+    }
     if (HAL_GetTick() < low_save_enable_tick) {
         return;
     }
@@ -435,17 +474,18 @@ void send_page_change(uint8_t page_num) {
         0x5A, 0x01, 0x00, page_num
     };
     dwin_uart_send(cmd, 10);
-    HAL_Delay(30);
     current_page = page_num;
+    if (page_num == 1U || page_num == 2U) {
+        var_icon_user_locked = 0;
+        dwin_icon_burst_from_eeprom(4);
+        eeprom_save_current_page(page_num);
+    }
 }
 
 void dwin_boot_to_page(uint8_t page_num) {
     HAL_Delay(3000);  // show 00.bmp for 3 seconds
-    for (uint8_t i = 0; i < 3; i++) {
-        send_page_change(page_num);
-        HAL_Delay(100);
-    }
-    HAL_Delay(500);
+    send_page_change(page_num);
+    HAL_Delay(100);
 }
 
 void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low) {
@@ -471,7 +511,166 @@ void send_var_icon_to_display(void) {
         var_icon_data[0], var_icon_data[1]
     };
     dwin_uart_send(cmd, 8);
-    HAL_Delay(20);
+    HAL_Delay(2);
+}
+
+static void send_var_icon_fast(void) {
+    uint8_t cmd[8] = {
+        0x5A, 0xA5, 0x05, 0x82,
+        (uint8_t)((VP_VAR_ICON >> 8) & 0xFF),
+        (uint8_t)(VP_VAR_ICON & 0xFF),
+        var_icon_data[0], var_icon_data[1]
+    };
+    dwin_uart_send(cmd, 8);
+}
+
+void eeprom_save_current_page(uint8_t page_num) {
+    if (page_num != 1U && page_num != 2U) {
+        return;
+    }
+    saved_settings_page = page_num;
+    current_page_array[0] = EEPROM_PAGE_MAGIC;
+    current_page_array[1] = page_num;
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_PAGE,
+                          I2C_MEMADD_SIZE_16BIT, current_page_array, 2, 1000);
+        HAL_Delay(10);
+    }
+}
+
+static uint8_t eeprom_parse_saved_page(const uint8_t *buf) {
+    if (buf[0] == EEPROM_PAGE_MAGIC &&
+        (buf[1] == 1U || buf[1] == 2U)) {
+        return buf[1];
+    }
+    if (buf[0] == 0x00U && (buf[1] == 1U || buf[1] == 2U)) {
+        return buf[1];
+    }
+    return 0U;
+}
+
+static uint8_t var_icon_from_mode_key(uint16_t key) {
+    if (key == MODE_KEY_HIGH || key == 0x004f || key == 0x4f) {
+        return ICON_HIGH;
+    }
+    if (key == MODE_KEY_LOW || key == 0x004e || key == 0x4e) {
+        return ICON_LOW;
+    }
+    if (key == MODE_KEY_BIPOLAR || key == 0x004d || key == 0x4d) {
+        return ICON_BIPOLAR;
+    }
+    return 0U;
+}
+
+static uint8_t var_icon_from_mode(uint16_t m) {
+    if (m == 0x4f) {
+        return ICON_HIGH;
+    }
+    if (m == 0x4e) {
+        return ICON_LOW;
+    }
+    if (m == 0x4d) {
+        return ICON_BIPOLAR;
+    }
+    return BOOT_VAR_ICON_VALUE;
+}
+
+void eeprom_read_var_icon(void) {
+    uint8_t buf[2] = {0xFF, 0xFF};
+    uint8_t legacy[2] = {0xFF, 0xFF};
+
+    dwin_set_var_icon(var_icon_from_mode(mode));
+
+    if (i2c_eeprom_read16(EEPROM_ADDR_VAR_ICON, buf)) {
+        if (buf[0] == EEPROM_ICON_MAGIC &&
+            buf[1] >= MIN_VAR_ICON_VALUE && buf[1] <= VAR_ICON_KEY_MAX) {
+            dwin_set_var_icon((uint16_t)buf[1]);
+            return;
+        }
+
+        uint16_t icon = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+        if (icon >= MIN_VAR_ICON_VALUE && icon <= VAR_ICON_KEY_MAX) {
+            dwin_set_var_icon(icon);
+            eeprom_save_var_icon();
+            return;
+        }
+    }
+
+    if (i2c_eeprom_read16(EEPROM_ADDR_VAR_ICON_OLD, legacy)) {
+        if (legacy[0] == EEPROM_ICON_MAGIC &&
+            legacy[1] >= MIN_VAR_ICON_VALUE && legacy[1] <= VAR_ICON_KEY_MAX) {
+            dwin_set_var_icon((uint16_t)legacy[1]);
+            eeprom_save_var_icon();
+            return;
+        }
+
+        uint16_t icon = (uint16_t)(((uint16_t)legacy[0] << 8) | legacy[1]);
+        if (icon >= MIN_VAR_ICON_VALUE && icon <= VAR_ICON_KEY_MAX) {
+            dwin_set_var_icon(icon);
+            eeprom_save_var_icon();
+            return;
+        }
+    }
+
+    eeprom_save_var_icon();
+}
+
+void eeprom_save_var_icon(void) {
+    uint8_t buf[2];
+
+    if (var_icon_value < MIN_VAR_ICON_VALUE || var_icon_value > VAR_ICON_KEY_MAX) {
+        return;
+    }
+
+    buf[0] = EEPROM_ICON_MAGIC;
+    buf[1] = (uint8_t)var_icon_value;
+    var_icon_data[0] = 0x00;
+    var_icon_data[1] = buf[1];
+
+    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_VAR_ICON,
+                          I2C_MEMADD_SIZE_16BIT, buf, 2, 1000);
+        HAL_Delay(10);
+        if (current_page == 1U || current_page == 2U) {
+            eeprom_save_current_page((uint8_t)current_page);
+        }
+    } else {
+        eeprom_err = true;
+    }
+}
+
+static uint8_t dwin_get_boot_page(void) {
+    if (saved_settings_page == 1U || saved_settings_page == 2U) {
+        return saved_settings_page;
+    }
+    if (mode == 0x4f || mode == 0x4d) {
+        return 1U;
+    }
+    return 2U;
+}
+
+static void eeprom_read_saved_page(void) {
+    uint8_t legacy[2] = {0xFF, 0xFF};
+    saved_settings_page = 0;
+    current_page = 0;
+    current_page_array[0] = 0xFF;
+    current_page_array[1] = 0xFF;
+
+    if (i2c_eeprom_read16(EEPROM_ADDR_PAGE, current_page_array)) {
+        saved_settings_page = eeprom_parse_saved_page(current_page_array);
+    }
+
+    if (saved_settings_page == 0U &&
+        i2c_eeprom_read16(EEPROM_ADDR_PAGE_OLD, legacy)) {
+        saved_settings_page = eeprom_parse_saved_page(legacy);
+        if (saved_settings_page != 0U) {
+            eeprom_save_current_page(saved_settings_page);
+        }
+    }
+
+    if (saved_settings_page == 1U || saved_settings_page == 2U) {
+        current_page = saved_settings_page;
+    }
 }
 
 void eeprom_read_low_value(void) {
@@ -492,6 +691,9 @@ void eeprom_read_low_value(void) {
     HAL_Delay(10);
 
     if (loww[0] == 0xFF && loww[1] == 0xFF) {
+        low = 0;
+        loww[0] = 0x00;
+        loww[1] = 0x00;
         eeprom_save_low_value();
         return;
     }
@@ -510,6 +712,9 @@ void eeprom_save_low_value(void) {
         HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_LOW, I2C_MEMADD_SIZE_16BIT,
                           loww, 2, 1000);
         HAL_Delay(10);
+        if (current_page == 2U) {
+            eeprom_save_current_page(2U);
+        }
     } else {
         eeprom_err = true;
     }
@@ -598,7 +803,6 @@ static void dwin_disable_backlight_standby(void) {
     /* VP 0x0080: bit2=0 standby off, bit3=1 touch buzzer ON (0x30 mutes buzzer) */
     uint8_t cmd[10] = {0x5A, 0xA5, 0x07, 0x82, 0x00, 0x80, 0x5A, 0x00, 0x00, 0x38};
     dwin_uart_send(cmd, 10);
-    HAL_Delay(25);
 }
 
 static void brightness_user_changed(uint16_t requested) {
@@ -714,6 +918,9 @@ void eeprom_save_vp3003_value(void) {
         HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_VP3003, I2C_MEMADD_SIZE_16BIT,
                           vp3003w, 2, 1000);
         HAL_Delay(10);
+        if (current_page == 1U) {
+            eeprom_save_current_page(1U);
+        }
     } else {
         eeprom_err = true;
     }
@@ -750,20 +957,49 @@ static void vp3003_apply_mode_key(uint16_t new_mode) {
     }
     previous_mode = new_mode;
     send_variable_data(0x30, 0x00, modee[0], modee[1]);
-    current_page = 1;
-    eeprom_read_vp3003_value();
-    dwin_refresh_page1_values();
+    dwin_show_settings_page(1U);
 }
 
 static uint8_t vp3003_is_mode_return_key(uint16_t val) {
-    return (val == MODE_KEY_HIGH || val == 0x4f ||
-            val == MODE_KEY_BIPOLAR || val == 0x4d);
+    return (var_icon_from_mode_key(val) != 0U);
+}
+
+static void var_icon_apply_return_key(uint16_t key) {
+    uint8_t icon_id = var_icon_from_mode_key(key);
+    if (icon_id == 0U) {
+        return;
+    }
+
+    dwin_set_var_icon(icon_id);
+    eeprom_save_var_icon();
+    var_icon_user_locked = 1;
+
+    if (key == MODE_KEY_HIGH || key == 0x004f || key == 0x4f) {
+        vp3003_apply_mode_key(0x4f);
+    } else if (key == MODE_KEY_LOW || key == 0x004e || key == 0x4e) {
+        mode = 0x4e;
+        modee[0] = 0x00;
+        modee[1] = 0x4e;
+        if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
+            HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x000A,
+                              I2C_MEMADD_SIZE_16BIT, modee, 2, 1000);
+            HAL_Delay(10);
+        } else {
+            eeprom_err = true;
+        }
+        previous_mode = 0x4e;
+        send_variable_data(0x30, 0x00, modee[0], modee[1]);
+        dwin_show_settings_page(2U);
+    } else {
+        vp3003_apply_mode_key(0x4d);
+    }
+
+    dwin_icon_burst_fast(3);
 }
 
 static void vp3003_handle_page1_rx(uint16_t new_val) {
     if (current_page != 1) {
-        current_page = 1;
-        dwin_refresh_page1_values();
+        dwin_show_settings_page(1U);
         if (vp3003_is_page_default(new_val)) {
             return;
         }
@@ -849,51 +1085,158 @@ void low_send_to_display(void) {
     low_push_display_from_eeprom();
 }
 
-void dwin_refresh_page2_values(void) {
+static void dwin_arm_var_icon_timers(void) {
+    var_icon_save_enable_tick = HAL_GetTick() + 5000;
+    var_icon_display_push_until = HAL_GetTick() + 15000;
+    var_icon_boot_push_until = HAL_GetTick() + 20000;
+    var_icon_aggressive_until = HAL_GetTick() + 3000;
+    eeprom_read_var_icon();
+}
+
+static void dwin_arm_page2_restore_timers(void) {
     low_user_touched = 0;
-    low_push_display_from_eeprom();
-    send_var_icon_to_display();
     low_save_enable_tick = HAL_GetTick() + 5000;
-    low_display_push_until = HAL_GetTick() + 10000;
-    HAL_Delay(150);
+    dwin_arm_var_icon_timers();
+    low_display_push_until = HAL_GetTick() + 15000;
+}
+
+static void dwin_push_icon_from_eeprom(void) {
+    eeprom_read_var_icon();
+    send_var_icon_to_display();
+}
+
+static void dwin_icon_burst_fast(uint8_t count) {
+    while (count > 0U) {
+        send_var_icon_fast();
+        count--;
+    }
+}
+
+static void dwin_icon_burst_from_eeprom(uint8_t count) {
+    eeprom_read_var_icon();
+    dwin_icon_burst_fast(count);
+}
+
+static void dwin_restore_var_icon_from_eeprom(uint8_t burst_count) {
+    dwin_arm_var_icon_timers();
+    eeprom_read_var_icon();
+    if (burst_count > 0U) {
+        dwin_icon_burst_fast(burst_count);
+    } else {
+        send_var_icon_fast();
+    }
+}
+
+static void dwin_push_page2_from_eeprom(void) {
+    eeprom_read_low_value();
+    previous_low = low;
     low_sync_both_vps();
-    HAL_Delay(150);
+    eeprom_read_var_icon();
+    dwin_icon_burst_fast(2);
+}
+
+static void dwin_restore_page_from_eeprom(uint8_t page_num) {
+    if (page_num == 1U) {
+        eeprom_read_vp3003_value();
+        vp3003_user_touched = 0;
+        vp3003_save_enable_tick = HAL_GetTick() + 3000;
+        vp3003_page1_restore_until = HAL_GetTick() + 5000;
+        vp3003_send_to_display();
+        eeprom_read_var_icon();
+        dwin_icon_burst_fast(2);
+    } else if (page_num == 2U) {
+        dwin_arm_page2_restore_timers();
+        dwin_push_page2_from_eeprom();
+    }
+}
+
+static void dwin_show_settings_page(uint8_t page_num) {
+    if (page_num != 1U && page_num != 2U) {
+        return;
+    }
+
+    if (page_num == 2U) {
+        eeprom_read_low_value();
+        eeprom_read_var_icon();
+    } else {
+        eeprom_read_vp3003_value();
+    }
+
+    if (current_page != page_num) {
+        send_page_change(page_num);
+    } else {
+        eeprom_save_current_page(page_num);
+        dwin_icon_burst_fast(4);
+    }
+
+    if (page_num == 2U) {
+        dwin_arm_page2_restore_timers();
+        eeprom_read_low_value();
+        low_sync_both_vps();
+        dwin_icon_burst_fast(2);
+    } else {
+        dwin_arm_var_icon_timers();
+        dwin_restore_page_from_eeprom(1U);
+        vp3003_send_to_display();
+        dwin_refresh_brightness();
+        dwin_icon_burst_fast(2);
+    }
+}
+
+void dwin_refresh_page2_values(void) {
+    dwin_arm_page2_restore_timers();
+    eeprom_read_low_value();
+    eeprom_read_var_icon();
     low_sync_both_vps();
+    dwin_icon_burst_fast(3);
 }
 
 void dwin_refresh_page1_values(void) {
-    eeprom_read_vp3003_value();
-    vp3003_user_touched = 0;
-    vp3003_save_enable_tick = HAL_GetTick() + 2500;
-    vp3003_page1_restore_until = HAL_GetTick() + 5000;
-    vp3003_send_to_display();
+    dwin_restore_page_from_eeprom(1U);
+    eeprom_read_var_icon();
+    dwin_icon_burst_fast(3);
+}
+
+void dwin_restore_saved_state(uint8_t page_num) {
+    current_page = page_num;
+    saved_settings_page = page_num;
+    if (page_num == 1U || page_num == 2U) {
+        eeprom_save_current_page(page_num);
+    }
+
+    dwin_arm_var_icon_timers();
+
+    send_variable_data(0x30, 0x00, modee[0], modee[1]);
+
+    brightness_user_touched = 0;
+    eeprom_read_brightness();
+    dwin_disable_backlight_standby();
+    dwin_send_brightness_quick();
+    brightness_save_enable_tick = HAL_GetTick() + 500;
+    brightness_display_push_until = HAL_GetTick() + 5000;
+
+    dwin_restore_page_from_eeprom(page_num);
+    if (page_num == 2U) {
+        eeprom_read_low_value();
+        low_sync_both_vps();
+    } else {
+        vp3003_send_to_display();
+    }
+    dwin_icon_burst_from_eeprom(6);
 }
 
 void dwin_open_page1(void) {
-    send_page_change(0x01);
-    HAL_Delay(700);
-    dwin_refresh_page1_values();
-    HAL_Delay(400);
-    vp3003_send_to_display();
-    dwin_refresh_brightness();
+    dwin_show_settings_page(1U);
 }
 
 void dwin_open_page2(void) {
-    send_page_change(0x02);
-    HAL_Delay(500);
-    dwin_refresh_page2_values();
+    dwin_show_settings_page(2U);
 }
 
 void dwin_apply_boot_var_icon(void) {
-    dwin_set_var_icon(BOOT_VAR_ICON_VALUE);
-    send_var_icon_to_display();
-    send_var_icon_to_display();
-
-    if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-        HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300, I2C_MEMADD_SIZE_16BIT,
-                          var_icon_data, 2, 1000);
-        HAL_Delay(10);
-    }
+    eeprom_read_var_icon();
+    dwin_arm_var_icon_timers();
+    dwin_icon_burst_fast(4);
 }
 /* USER CODE END 0 */
 
@@ -937,19 +1280,15 @@ int main(void)
 
   HAL_Delay(200);
 
-  low_save_enable_tick = HAL_GetTick() + 30000;
+  low_save_enable_tick = 0;
 
   /* Read EEPROM before any display UART (so we know the real low value) */
   eeprom_read_low_value();
-
-  i2c_eeprom_read16(0x0200, current_page_array);
-  current_page = (current_page_array[0] << 8) | current_page_array[1];
-  if (current_page != 2) {
-      current_page = 2;
-  }
+  eeprom_read_saved_page();
 
   i2c_eeprom_read16(0x000A, modee);
   mode = (modee[0] << 8) | modee[1];
+  previous_mode = mode;
 
   i2c_eeprom_read16(0x0014, highh);
   high = (highh[0] << 8) | highh[1];
@@ -959,12 +1298,12 @@ int main(void)
 
   eeprom_read_vp3003_value();
   eeprom_read_brightness();
+  eeprom_read_var_icon();
 
-  /* Page 2 splash — VP restore happens only after DWIN finishes loading */
-  dwin_boot_to_page(0x02);
-  HAL_Delay(500);
+  {
+  uint8_t boot_page = dwin_get_boot_page();
 
-  dwin_uart_rx_start();
+  dwin_boot_to_page(boot_page);
 
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_3);
@@ -972,14 +1311,12 @@ int main(void)
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 300);
 
-  send_variable_data(0x30, 0x00, modee[0], modee[1]);
+  dwin_restore_saved_state(boot_page);
+  boot_page_guard_until = HAL_GetTick() + 8000;
+  previous_mode = mode;
 
-  current_page = 2;
-
-  dwin_apply_boot_var_icon();
-  dwin_refresh_brightness();
-  HAL_Delay(400);
-  dwin_refresh_page2_values();
+  dwin_uart_rx_start();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -989,6 +1326,22 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     HAL_Delay(1);
+
+    if (HAL_GetTick() < var_icon_aggressive_until) {
+        send_var_icon_fast();
+    } else if (HAL_GetTick() < var_icon_boot_push_until) {
+        static uint32_t last_boot_icon = 0;
+        if (HAL_GetTick() - last_boot_icon >= 30) {
+            send_var_icon_fast();
+            last_boot_icon = HAL_GetTick();
+        }
+    } else if (HAL_GetTick() < var_icon_display_push_until) {
+        static uint32_t last_icon_push = 0;
+        if (HAL_GetTick() - last_icon_push >= 80) {
+            dwin_push_icon_from_eeprom();
+            last_icon_push = HAL_GetTick();
+        }
+    }
 
     if (dwin_pkt_ready) {
         dwin_pkt_ready = 0;
@@ -1007,9 +1360,12 @@ int main(void)
         }
     }
 
-    if (!low_user_touched && HAL_GetTick() < low_display_push_until) {
+    if (current_page == 2U && !low_user_touched &&
+        HAL_GetTick() < low_display_push_until) {
         static uint32_t last_low_push = 0;
-        if (HAL_GetTick() - last_low_push >= 600) {
+        if (HAL_GetTick() - last_low_push >= 350) {
+            eeprom_read_low_value();
+            previous_low = low;
             low_sync_both_vps();
             last_low_push = HAL_GetTick();
         }
@@ -1498,6 +1854,22 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+static uint8_t var_icon_is_user_key(uint16_t val) {
+    return (val >= MIN_VAR_ICON_VALUE && val <= VAR_ICON_KEY_MAX);
+}
+
+static void var_icon_user_changed(uint16_t new_value) {
+    if (!var_icon_is_user_key(new_value)) {
+        return;
+    }
+    if (new_value == var_icon_value) {
+        return;
+    }
+    dwin_set_var_icon(new_value);
+    eeprom_save_var_icon();
+    var_icon_user_locked = 1;
+}
+
 void send_low_to_display(void) {
     low_sync_both_vps();
 }
@@ -1510,13 +1882,8 @@ void save_reading(void) {
         if (address == VP_VAR_ICON) {
             uint16_t new_value = dataa;
 
-            /* Page 1 mode return keys — select mode and restore VP 0x3003 from EEPROM */
-            if (current_page == 1 && vp3003_is_mode_return_key(new_value)) {
-                if (new_value == MODE_KEY_HIGH || new_value == 0x4f) {
-                    vp3003_apply_mode_key(0x4f);
-                } else {
-                    vp3003_apply_mode_key(0x4d);
-                }
+            if (var_icon_from_mode_key(new_value) != 0U) {
+                var_icon_apply_return_key(new_value);
                 return;
             }
 
@@ -1524,17 +1891,16 @@ void save_reading(void) {
                 return;
             }
 
-            // Page 2 only: return keys icons 76/77/78 — display updates itself
-            if (current_page == 2 &&
-                new_value >= MIN_VAR_ICON_VALUE && new_value <= VAR_ICON_KEY_MAX) {
-                dwin_set_var_icon(new_value);
-                if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                    HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300,
-                    I2C_MEMADD_SIZE_16BIT, var_icon_data, 2, 1000);
-                    HAL_Delay(10);
-                } else {
-                    eeprom_err = true;
-                }
+            if (var_icon_is_user_key(new_value)) {
+                var_icon_user_changed(new_value);
+                return;
+            }
+
+            if (var_icon_user_locked) {
+                return;
+            }
+
+            if (HAL_GetTick() < var_icon_save_enable_tick) {
                 return;
             }
 
@@ -1544,14 +1910,6 @@ void save_reading(void) {
                 return;
             }
 
-            dwin_set_var_icon(new_value);
-            if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
-                HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, 0x0300,
-                I2C_MEMADD_SIZE_16BIT, var_icon_data, 2, 1000);
-                HAL_Delay(10);
-            } else {
-                eeprom_err = true;
-            }
             return;
         }
 
@@ -1567,11 +1925,28 @@ void save_reading(void) {
             } else {
                 eeprom_err = true;
             }
-            if (mode == 0x4f || mode == 0x4d) {
-                current_page = 1;
-                eeprom_read_vp3003_value();
-                dwin_refresh_page1_values();
+            var_icon_user_changed(var_icon_from_mode(mode));
+            dwin_icon_burst_fast(3);
+            if (mode == 0x4e) {
+                if (HAL_GetTick() >= boot_page_guard_until) {
+                    if (current_page != 2U) {
+                        dwin_show_settings_page(2U);
+                    } else {
+                        dwin_refresh_page2_values();
+                    }
+                }
+            } else if (mode == 0x4f || mode == 0x4d) {
+                if (HAL_GetTick() >= boot_page_guard_until) {
+                    if (current_page != 1U) {
+                        dwin_show_settings_page(1U);
+                    } else {
+                        eeprom_save_current_page(1);
+                        eeprom_read_vp3003_value();
+                        dwin_refresh_page1_values();
+                    }
+                }
             }
+            dwin_restore_var_icon_from_eeprom(3);
             return;
         }
 
@@ -1610,16 +1985,20 @@ void save_reading(void) {
 
 void send_loadings(void) {
     if (mode != previous_mode) {
+        if (HAL_GetTick() < boot_page_guard_until) {
+            previous_mode = mode;
+            return;
+        }
         if (mode == 0x4e) {
-            dwin_open_page2();
+            dwin_show_settings_page(2U);
         } else if (mode == 0x4f || mode == 0x4d) {
-            if (current_page == 1) {
-                eeprom_read_vp3003_value();
+            if (current_page == 1U) {
                 dwin_refresh_page1_values();
             } else {
-                dwin_open_page1();
+                dwin_show_settings_page(1U);
             }
         }
+        dwin_restore_var_icon_from_eeprom(3);
         previous_mode = mode;
     }
 }
