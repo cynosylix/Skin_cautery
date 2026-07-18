@@ -92,13 +92,25 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+#define DWIN_PKT_MAX         20
+#define DWIN_RX_Q_DEPTH      8
+
 int count;
 int test;
-uint8_t RxData[12];
+uint8_t RxData[DWIN_PKT_MAX];
 uint8_t rxBuffer[12];
-uint8_t rxData[12];
+uint8_t rxData[DWIN_PKT_MAX];
 volatile uint16_t rxIndex = 0;
 static uint8_t uart_rx_started = 0;
+
+typedef struct {
+    uint8_t len;
+    uint8_t data[DWIN_PKT_MAX];
+} dwin_rx_pkt_t;
+
+static volatile dwin_rx_pkt_t dwin_rx_q[DWIN_RX_Q_DEPTH];
+static volatile uint8_t dwin_q_w = 0;
+static volatile uint8_t dwin_q_r = 0;
 uint16_t address, dataa, mode, high, bipolar, low, icon_id, brightnes,
 		current_page, previous_mode;
 uint8_t duty;
@@ -126,6 +138,22 @@ static uint32_t brightness_save_enable_tick = 0;
 static uint8_t brightness_user_touched = 0;
 static uint8_t low_user_touched = 0;
 static uint32_t low_last_accept_tick = 0;
+static uint32_t low_eeprom_save_deadline = 0;
+static uint8_t low_eeprom_dirty = 0;
+static uint32_t low_hold_last_rx_ms = 0;
+static uint8_t low_hold_stream = 0;
+static uint32_t low_hold_step_ms = 0;
+#define LOW_UART_QUIET_MS    1200U
+
+static uint8_t dwin_tx_low_quiet(void) {
+    if (mode != 0x4e || !low_user_touched) {
+        return 0U;
+    }
+    if (current_page != 1U && current_page != 2U) {
+        return 0U;
+    }
+    return ((HAL_GetTick() - low_last_accept_tick) < LOW_UART_QUIET_MS) ? 1U : 0U;
+}
 static uint32_t vp3003_save_enable_tick = 0;
 static uint32_t vp3003_page1_restore_until = 0;
 static uint8_t vp3003_user_touched = 0;
@@ -180,7 +208,7 @@ void send_low_to_display(void);
 void send_page_change(uint8_t page_num);
 void dwin_boot_to_page(uint8_t page_num);
 void dwin_uart_rx_start(void);
-void low_value_user_changed(uint16_t new_low);
+void low_value_user_changed(uint16_t new_low, uint16_t src_addr);
 void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low);
 void dwin_set_var_icon(uint16_t icon_id);
 void send_var_icon_to_display(void);
@@ -220,8 +248,66 @@ void dwin_open_page1(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 static uint8_t i2c_eeprom_read16(uint16_t addr, uint8_t *buf);
+static void dwin_uart_send(const uint8_t *data, uint16_t len);
 static void send_var_icon_fast(void);
 static void dwin_icon_burst_fast(uint8_t count);
+static void send_variable_data_fast(uint8_t ah, uint8_t al, uint8_t dh, uint8_t dl);
+static void low_apply_value(uint16_t val);
+static void low_push_vps_fast(void);
+static void low_hold_service(void);
+static void low_vp1000_rx(uint16_t rx_val);
+
+static void dwin_rx_queue_push(const uint8_t *pkt, uint8_t len) {
+    uint8_t next = (uint8_t)((dwin_q_w + 1U) % DWIN_RX_Q_DEPTH);
+    if (next == dwin_q_r) {
+        dwin_q_r = (uint8_t)((dwin_q_r + 1U) % DWIN_RX_Q_DEPTH);
+    }
+    if (len > DWIN_PKT_MAX) {
+        len = DWIN_PKT_MAX;
+    }
+    memcpy((void *)dwin_rx_q[dwin_q_w].data, pkt, len);
+    dwin_rx_q[dwin_q_w].len = len;
+    dwin_q_w = next;
+}
+
+static uint8_t dwin_rx_queue_pop(uint8_t *pkt, uint8_t max_len) {
+    if (dwin_q_r == dwin_q_w) {
+        return 0U;
+    }
+    uint8_t len = dwin_rx_q[dwin_q_r].len;
+    if (len > max_len) {
+        len = max_len;
+    }
+    memcpy(pkt, (const void *)dwin_rx_q[dwin_q_r].data, len);
+    dwin_q_r = (uint8_t)((dwin_q_r + 1U) % DWIN_RX_Q_DEPTH);
+    return len;
+}
+
+static void dwin_rx_collect_packets(void) {
+    while (rxIndex >= 5U) {
+        if (rxData[0] != 0x5A || rxData[1] != 0xA5) {
+            memmove(rxData, rxData + 1, rxIndex - 1U);
+            rxIndex--;
+            continue;
+        }
+        uint8_t total_len = (uint8_t)(rxData[2] + 3U);
+        if (total_len < 4U || total_len > DWIN_PKT_MAX) {
+            memmove(rxData, rxData + 1, rxIndex - 1U);
+            rxIndex--;
+            continue;
+        }
+        if (rxIndex < total_len) {
+            break;
+        }
+        dwin_rx_queue_push(rxData, total_len);
+        if (rxIndex > total_len) {
+            memmove(rxData, rxData + total_len, rxIndex - total_len);
+            rxIndex = (uint16_t)(rxIndex - total_len);
+        } else {
+            rxIndex = 0;
+        }
+    }
+}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 	if (huart->Instance == USART3) {
@@ -230,25 +316,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 		}
 
 		HAL_UART_Receive_IT(&huart3, rxBuffer, 1);
-
-		if (rxIndex >= 5) {
-			if (rxData[0] == 0x5A && rxData[1] == 0xA5) {
-				uint8_t data_len = rxData[2];
-				uint8_t total_len = data_len + 3;
-
-				if (rxIndex >= total_len) {
-					for(int i = 0; i < total_len && i < (int)sizeof(RxData); i++) {
-						RxData[i] = rxData[i];
-					}
-					dwin_pkt_ready = 1;
-					memset(rxData, 0, sizeof(rxData));
-					rxIndex = 0;
-				}
-			} else {
-				memset(rxData, 0, sizeof(rxData));
-				rxIndex = 0;
-			}
-		}
+		dwin_rx_collect_packets();
 	}
 }
 
@@ -347,14 +415,20 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
         }
     }
 
-    /* VP 0x1000 / 0x3002 — DWIN 0x83 auto-upload uses bytes 7-8, not 6-7 */
     if ((*addr == VP_LOW_VALUE || *addr == VP_LOW_DATA) && cmd == 0x83) {
         if (len >= 6) {
-            *data = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[8]);
-            *valid = 1;
+            uint16_t v78 = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[8]);
+            uint16_t v67 = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            if (v78 <= LOW_VALUE_MAX) {
+                *data = v78;
+                *valid = 1;
+            } else if (v67 <= LOW_VALUE_MAX) {
+                *data = v67;
+                *valid = 1;
+            }
             return;
         }
-        if (len >= 4) {
+        if (len >= 5) {
             uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
             uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
             if (be <= LOW_VALUE_MAX) {
@@ -366,16 +440,31 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
             }
             return;
         }
+        if (len >= 4 && RxData[6] <= LOW_VALUE_MAX) {
+            *data = RxData[6];
+            *valid = 1;
+            return;
+        }
     }
 
-    if ((*addr == VP_LOW_VALUE || *addr == VP_LOW_DATA) && cmd == 0x82 && len >= 5) {
-        uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
-        uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
-        if (be <= LOW_VALUE_MAX) {
-            *data = be;
-            *valid = 1;
-        } else if (le <= LOW_VALUE_MAX) {
-            *data = le;
+    if ((*addr == VP_LOW_VALUE || *addr == VP_LOW_DATA) && cmd == 0x82) {
+        /* Prefer 2-byte value before single byte (00 01 must be 1, not 0) */
+        if (len >= 5) {
+            uint16_t be = (uint16_t)(((uint16_t)RxData[6] << 8) | RxData[7]);
+            uint16_t le = (uint16_t)(((uint16_t)RxData[7] << 8) | RxData[6]);
+            if (be <= LOW_VALUE_MAX) {
+                *data = be;
+                *valid = 1;
+                return;
+            }
+            if (le <= LOW_VALUE_MAX) {
+                *data = le;
+                *valid = 1;
+                return;
+            }
+        }
+        if (len >= 4 && RxData[6] <= LOW_VALUE_MAX) {
+            *data = RxData[6];
             *valid = 1;
         }
         return;
@@ -417,47 +506,126 @@ void dwin_rx_get_vp(uint16_t *addr, uint16_t *data, uint8_t *valid) {
     }
 }
 
-void low_value_user_changed(uint16_t new_low) {
-    if (new_low > LOW_VALUE_MAX) {
-        new_low = LOW_VALUE_MAX;
-    }
+static void low_sync_display_vp(void) {
+    low_push_vps_fast();
+}
 
-    /* DWIN VP 0x2002 icon=low/2 snaps even values back (20→19, 200→199) */
-    if (new_low == low - 1 && (low & 1U) == 0U && low > 0U &&
-        (HAL_GetTick() - low_last_accept_tick) < 500U) {
+static void send_variable_data_fast(uint8_t addr_high, uint8_t addr_low,
+                                    uint8_t data_high, uint8_t data_low) {
+    uint16_t vp = (uint16_t)(((uint16_t)addr_high << 8) | addr_low);
+    if (dwin_tx_low_quiet() &&
+        (vp == VP_LOW_VALUE || vp == VP_LOW_DATA || vp == VP_VAR_ICON)) {
         return;
     }
+    uint8_t cmd[8] = {
+        0x5A, 0xA5, 0x05, 0x82,
+        addr_high, addr_low, data_high, data_low
+    };
+    dwin_uart_send(cmd, 8);
+}
 
-    /* 22.bin floods 200/110 on page load — never save, never UART echo */
-    if ((new_low == LOW_VALUE_MAX || new_low == 110) && low < (LOW_VALUE_MAX - 3)) {
+static void low_push_vps_fast(void) {
+    uint8_t dh = (uint8_t)((low >> 8) & 0xFF);
+    uint8_t dl = (uint8_t)(low & 0xFF);
+    send_variable_data_fast((uint8_t)((VP_LOW_VALUE >> 8) & 0xFF),
+                            (uint8_t)(VP_LOW_VALUE & 0xFF), dh, dl);
+    send_variable_data_fast((uint8_t)((VP_LOW_DATA >> 8) & 0xFF),
+                            (uint8_t)(VP_LOW_DATA & 0xFF), dh, dl);
+}
+
+static void low_apply_value(uint16_t val) {
+    if (val > LOW_VALUE_MAX) {
+        val = LOW_VALUE_MAX;
+    }
+    if (val == low) {
         return;
     }
-
-    if (new_low == low) {
-        return;
-    }
-
-    low = new_low;
+    low = val;
     loww[0] = (uint8_t)((low >> 8) & 0xFF);
     loww[1] = (uint8_t)(low & 0xFF);
-    eeprom_save_low_value();
+    low_eeprom_dirty = 1;
+    low_eeprom_save_deadline = HAL_GetTick() + 400;
     low_user_touched = 1;
     low_display_push_until = 0;
+    var_icon_display_push_until = 0;
+    var_icon_boot_push_until = 0;
+    var_icon_aggressive_until = 0;
     low_last_accept_tick = HAL_GetTick();
-
     if (mode == 0x4e && ((footswitch) || (active))) {
         lowfunction(low);
     }
 }
 
-static void low_handle_rx(uint16_t new_low) {
-    if (current_page != 2U) {
-        return;
+static void low_vp1000_rx(uint16_t rx_val) {
+    if (rx_val > LOW_VALUE_MAX) {
+        rx_val = LOW_VALUE_MAX;
     }
+
+    low_user_touched = 1;
+    low_display_push_until = 0;
+    var_icon_aggressive_until = 0;
+    var_icon_display_push_until = 0;
+    var_icon_boot_push_until = 0;
+    low_last_accept_tick = HAL_GetTick();
+
     if (HAL_GetTick() < low_save_enable_tick) {
+        if (rx_val == LOW_VALUE_MAX || rx_val == 110U) {
+            return;
+        }
+    }
+
+    if (rx_val != low) {
+        low_apply_value(rx_val);
+    }
+}
+
+static void low_hold_service(void) {
+    /* Physical DWIN handles hold locally — MCU must not write VP 0x1000/0x3002 */
+}
+
+void low_value_user_changed(uint16_t new_low, uint16_t src_addr) {
+    (void)src_addr;
+    low_apply_value(new_low);
+}
+
+static void low_eeprom_flush(void) {
+    if (!low_eeprom_dirty) {
         return;
     }
-    low_value_user_changed(new_low);
+    if (dwin_tx_low_quiet()) {
+        return;
+    }
+    if ((int32_t)(HAL_GetTick() - low_eeprom_save_deadline) < 0) {
+        return;
+    }
+    eeprom_save_low_value();
+    low_eeprom_dirty = 0;
+}
+
+static void low_handle_rx(uint16_t new_low, uint16_t src_addr) {
+    if (mode != 0x4e) {
+        return;
+    }
+
+    if (src_addr == VP_LOW_VALUE) {
+        if (current_page != 1U && current_page != 2U) {
+            return;
+        }
+        low_vp1000_rx(new_low);
+        return;
+    }
+
+    if (current_page != 1U && current_page != 2U) {
+        return;
+    }
+
+    if (HAL_GetTick() < low_save_enable_tick) {
+        if (new_low == LOW_VALUE_MAX || new_low == 110U) {
+            return;
+        }
+    }
+
+    low_value_user_changed(new_low, src_addr);
 }
 
 static void dwin_uart_send(const uint8_t *data, uint16_t len) {
@@ -489,12 +657,19 @@ void dwin_boot_to_page(uint8_t page_num) {
 }
 
 void send_variable_data(uint8_t addr_high, uint8_t addr_low, uint8_t data_high, uint8_t data_low) {
+    uint16_t vp = (uint16_t)(((uint16_t)addr_high << 8) | addr_low);
+    if (dwin_tx_low_quiet() &&
+        (vp == VP_LOW_VALUE || vp == VP_LOW_DATA || vp == VP_VAR_ICON)) {
+        return;
+    }
     uint8_t cmd[8] = {
         0x5A, 0xA5, 0x05, 0x82,
         addr_high, addr_low, data_high, data_low
     };
     dwin_uart_send(cmd, 8);
-    HAL_Delay(10);
+    if (!dwin_tx_low_quiet()) {
+        HAL_Delay(10);
+    }
 }
 
 void dwin_set_var_icon(uint16_t icon_id) {
@@ -504,6 +679,9 @@ void dwin_set_var_icon(uint16_t icon_id) {
 }
 
 void send_var_icon_to_display(void) {
+    if (dwin_tx_low_quiet()) {
+        return;
+    }
     uint8_t cmd[8] = {
         0x5A, 0xA5, 0x05, 0x82,
         (uint8_t)((VP_VAR_ICON >> 8) & 0xFF),
@@ -515,6 +693,9 @@ void send_var_icon_to_display(void) {
 }
 
 static void send_var_icon_fast(void) {
+    if (dwin_tx_low_quiet()) {
+        return;
+    }
     uint8_t cmd[8] = {
         0x5A, 0xA5, 0x05, 0x82,
         (uint8_t)((VP_VAR_ICON >> 8) & 0xFF),
@@ -711,8 +892,8 @@ void eeprom_save_low_value(void) {
     if (HAL_I2C_IsDeviceReady(&hi2c1, 0x50 << 1, 1, 10) == HAL_OK) {
         HAL_I2C_Mem_Write(&hi2c1, 0x50 << 1, EEPROM_ADDR_LOW, I2C_MEMADD_SIZE_16BIT,
                           loww, 2, 1000);
-        HAL_Delay(10);
-        if (current_page == 2U) {
+        HAL_Delay(5);
+        if (mode == 0x4e && (current_page == 1U || current_page == 2U)) {
             eeprom_save_current_page(2U);
         }
     } else {
@@ -989,6 +1170,11 @@ static void var_icon_apply_return_key(uint16_t key) {
         }
         previous_mode = 0x4e;
         send_variable_data(0x30, 0x00, modee[0], modee[1]);
+        vp3003_val = low;
+        vp3003w[0] = loww[0];
+        vp3003w[1] = loww[1];
+        eeprom_save_vp3003_value();
+        eeprom_save_current_page(2U);
         dwin_show_settings_page(2U);
     } else {
         vp3003_apply_mode_key(0x4d);
@@ -1066,6 +1252,9 @@ void vp3003_user_changed(uint16_t new_val) {
 }
 
 void low_sync_both_vps(void) {
+    if (dwin_tx_low_quiet()) {
+        return;
+    }
     uint8_t dh = (uint8_t)((low >> 8) & 0xFF);
     uint8_t dl = (uint8_t)(low & 0xFF);
 
@@ -1094,10 +1283,16 @@ static void dwin_arm_var_icon_timers(void) {
 }
 
 static void dwin_arm_page2_restore_timers(void) {
+    low_save_enable_tick = HAL_GetTick() + 1500;
+    var_icon_save_enable_tick = HAL_GetTick() + 1500;
+    var_icon_aggressive_until = HAL_GetTick() + 1500;
+    var_icon_display_push_until = 0;
+    var_icon_boot_push_until = 0;
+    low_display_push_until = HAL_GetTick() + 1500;
+    low_hold_stream = 0;
+    low_hold_last_rx_ms = 0;
+    low_hold_step_ms = 0;
     low_user_touched = 0;
-    low_save_enable_tick = HAL_GetTick() + 5000;
-    dwin_arm_var_icon_timers();
-    low_display_push_until = HAL_GetTick() + 15000;
 }
 
 static void dwin_push_icon_from_eeprom(void) {
@@ -1325,42 +1520,79 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_Delay(1);
+    /* Skip 1 ms wait while user holds VP 0x1000 +/- so UART packets are not missed */
+    if (!((current_page == 1U || current_page == 2U) && mode == 0x4e && low_user_touched)) {
+        HAL_Delay(1);
+    }
 
-    if (HAL_GetTick() < var_icon_aggressive_until) {
-        send_var_icon_fast();
-    } else if (HAL_GetTick() < var_icon_boot_push_until) {
-        static uint32_t last_boot_icon = 0;
-        if (HAL_GetTick() - last_boot_icon >= 30) {
+    if (!dwin_tx_low_quiet()) {
+        if (current_page != 2U) {
+            if (HAL_GetTick() < var_icon_aggressive_until) {
+                send_var_icon_fast();
+            } else if (HAL_GetTick() < var_icon_boot_push_until) {
+                static uint32_t last_boot_icon = 0;
+                if (HAL_GetTick() - last_boot_icon >= 30) {
+                    send_var_icon_fast();
+                    last_boot_icon = HAL_GetTick();
+                }
+            } else if (HAL_GetTick() < var_icon_display_push_until) {
+                static uint32_t last_icon_push = 0;
+                if (HAL_GetTick() - last_icon_push >= 80) {
+                    dwin_push_icon_from_eeprom();
+                    last_icon_push = HAL_GetTick();
+                }
+            }
+        } else if (HAL_GetTick() < var_icon_aggressive_until && !low_user_touched) {
             send_var_icon_fast();
-            last_boot_icon = HAL_GetTick();
-        }
-    } else if (HAL_GetTick() < var_icon_display_push_until) {
-        static uint32_t last_icon_push = 0;
-        if (HAL_GetTick() - last_icon_push >= 80) {
-            dwin_push_icon_from_eeprom();
-            last_icon_push = HAL_GetTick();
         }
     }
 
     if (dwin_pkt_ready) {
         dwin_pkt_ready = 0;
+    }
 
-        uint16_t rx_addr = 0;
-        uint16_t rx_data = 0;
-        uint8_t rx_valid = 0;
+    {
+        uint8_t pkt_len;
 
-        dwin_rx_get_vp(&rx_addr, &rx_data, &rx_valid);
-        if (rx_valid) {
-            address = rx_addr;
-            dataa = rx_data;
-            number_eeprome_flag = true;
-            prev_address = address;
-            prev_dataa = dataa;
+        while ((pkt_len = dwin_rx_queue_pop(RxData, sizeof(RxData))) != 0U) {
+            uint16_t rx_addr = 0;
+            uint16_t rx_data = 0;
+            uint8_t rx_valid = 0;
+
+            dwin_rx_get_vp(&rx_addr, &rx_data, &rx_valid);
+            if (rx_valid) {
+                address = rx_addr;
+                dataa = rx_data;
+                number_eeprome_flag = true;
+                prev_address = address;
+                prev_dataa = dataa;
+                save_reading();
+            }
         }
+
+        low_hold_service();
+        dwin_rx_collect_packets();
+
+        while ((pkt_len = dwin_rx_queue_pop(RxData, sizeof(RxData))) != 0U) {
+            uint16_t rx_addr = 0;
+            uint16_t rx_data = 0;
+            uint8_t rx_valid = 0;
+
+            dwin_rx_get_vp(&rx_addr, &rx_data, &rx_valid);
+            if (rx_valid) {
+                address = rx_addr;
+                dataa = rx_data;
+                number_eeprome_flag = true;
+                prev_address = address;
+                prev_dataa = dataa;
+                save_reading();
+            }
+        }
+        low_hold_service();
     }
 
     if (current_page == 2U && !low_user_touched &&
+        !dwin_tx_low_quiet() &&
         HAL_GetTick() < low_display_push_until) {
         static uint32_t last_low_push = 0;
         if (HAL_GetTick() - last_low_push >= 350) {
@@ -1391,6 +1623,7 @@ int main(void)
 
     save_reading();
     send_loadings();
+    low_eeprom_flush();
 
     dwin_poll_brightness();
 
@@ -1887,6 +2120,11 @@ void save_reading(void) {
                 return;
             }
 
+            /* Page 2 low +/- sends false VP 0x2000 values (77-79 from low/2 icon) */
+            if (current_page == 2U) {
+                return;
+            }
+
             if (new_value == var_icon_value) {
                 return;
             }
@@ -1904,9 +2142,7 @@ void save_reading(void) {
                 return;
             }
 
-            // Spurious increment writes — ignore silently (re-send causes blink)
-            if (new_value < MIN_VAR_ICON_VALUE ||
-                (new_value <= 100 && new_value == (uint16_t)(low / 2))) {
+            if (new_value < MIN_VAR_ICON_VALUE) {
                 return;
             }
 
@@ -1950,9 +2186,18 @@ void save_reading(void) {
             return;
         }
 
-        // VP 0x1000 or VP 0x3002 — save EEPROM and sync both VPs
+        // VP 0x1000 increment button — save to EEPROM (0x3002 is display-only on page 2)
         if (address == VP_LOW_VALUE || address == VP_LOW_DATA) {
-            low_handle_rx(dataa);
+            if (current_page == 2U && address == VP_LOW_DATA) {
+                return;
+            }
+            if (address == VP_LOW_VALUE && mode == 0x4e &&
+                (current_page == 1U || current_page == 2U)) {
+                low_user_touched = 1;
+                low_display_push_until = 0;
+                var_icon_aggressive_until = 0;
+            }
+            low_handle_rx(dataa, address);
             return;
         }
 
